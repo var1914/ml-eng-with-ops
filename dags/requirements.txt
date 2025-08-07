@@ -1,0 +1,9 @@
+
+# Add your Python dependencies here
+requests==2.32.4
+psycopg2-binary==2.9.10
+minio==7.2.10
+pandas
+numpy
+prometheus_client
+seaborn
