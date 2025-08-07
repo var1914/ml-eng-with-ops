@@ -1,0 +1,20 @@
+# MinIO Helm Chart Values
+# Minimal configuration with custom credentials
+
+# Authentication
+auth:
+  rootUser: "admin"
+  rootPassword: "admin123"
+
+# Persistence
+persistence:
+  enabled: true
+  size: 10Gi
+
+console:
+  enabled: true
+  extraEnvVars:
+    - name: CONSOLE_MINIO_SERVER_ACCESS_KEY
+      value: "admin"
+    - name: CONSOLE_MINIO_SERVER_SECRET_KEY
+      value: "admin123"

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-additional-config
+  namespace: ml-monitoring
+data:
+  additional-scrape-configs.yaml: |
+    - job_name: 'ml-pushgateway'
+      static_configs:
+        - targets: ['pushgateway-prometheus-pushgateway:9091']
+      scrape_interval: 30s
+      honor_labels: true
+    - job_name: 'ml-pipelines'
+      static_configs:
+        - targets: ['pushgateway-prometheus-pushgateway:9091']
+      metrics_path: /metrics
+      scrape_interval: 15s

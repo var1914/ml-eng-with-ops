@@ -1,0 +1,11 @@
+USER-SUPPLIED VALUES:
+grafana:
+  adminPassword: admin123
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    additionalScrapeConfigsSecret:
+      enabled: true
+      name: prometheus-additional-config
+      key: additional-scrape-configs.yaml

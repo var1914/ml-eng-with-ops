@@ -1,0 +1,38 @@
+# In your Helm values.yaml
+
+# Custom Docker image configuration
+images:
+  airflow:
+    repository: localhost:5050/custom-airflow
+    tag: latest
+    pullPolicy: Always
+
+dags:
+  persistence:
+    enabled: true
+    size: 1Gi
+
+webserver:
+  defaultUser:
+    username: admin
+    password: admin123
+
+executor: "KubernetesExecutor"
+
+workers:
+  persistence:
+    enabled: true
+
+logs:
+  persistence:
+    enabled: true
+    size: 5Gi
+
+config:
+  logging:
+    remote_logging: "False"  # Keep local for testing
+    colored_console_log: "True"
+
+env:
+  - name: AIRFLOW__LOGGING__BASE_LOG_FOLDER
+    value: /opt/airflow/logs
