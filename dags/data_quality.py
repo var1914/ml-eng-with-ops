@@ -3,8 +3,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
-from minio import Minio
-from minio.error import S3Error
 
 DB_CONFIG = {
     "dbname": "postgres",
@@ -18,67 +16,28 @@ DB_CONFIG = {
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT', 'XRPUSDT', 'DOTUSDT', 'AVAXUSDT', 'MATICUSDT', 'LINKUSDT']
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
-# MinIO Configuration
-MINIO_CONFIG = {
-    'endpoint': 'minio:9000',  # Adjust based on your Helm setup
-    'access_key': 'admin',  # Change these in production!
-    'secret_key': 'admin123',
-    'secure': False  # Set to True if using HTTPS
-}
-
-class DBConnections:
-    """Process batch data from Minio and push it to PostgreSQL"""
-
-    def __init__(self, symbol):
-        self.symbol = symbol
-        self.logger = logging.getLogger(f"process_{symbol}")
-        self.minio_client = self._get_minio_client()
-        self.db_connection = self._get_db_connection()
-
-    def _get_minio_client(self):
-        """Initialize MinIO client"""
-        try:
-            client = Minio(
-                MINIO_CONFIG['endpoint'],
-                access_key=MINIO_CONFIG['access_key'],
-                secret_key=MINIO_CONFIG['secret_key'],
-                secure=MINIO_CONFIG['secure']
-            )
-            self.logger.info(f"MinIO client initialized for {self.symbol}")
-            return client
-        except Exception as e:
-            self.logger.error(f"Failed to initialize MinIO client: {str(e)}")
-            raise
-
-    def _get_db_connection(self):
-        """Get database connection"""
-        try:
-            conn = psycopg2.connect(**DB_CONFIG)
-            return conn
-        except psycopg2.Error as e:
-            self.logger.error(f"Database connection failed: {str(e)}")
-            raise
-
-
-class DataQualityAssessment(DBConnections):
+class DataQualityAssessment():
     def __init__(self, db_config):
         self.logger = logging.getLogger("data_quality")
+        self.db_config = db_config
 
+    def get_db_connection(self):
+        return psycopg2.connect(**self.db_config)
+    
     def validate_timestamp_continuity(self, symbol, interval_minutes=60):
         """Check for gaps in timestamp continuity"""
         """Uses the LAG window function to get the previous row's open_time value when rows are ordered by open_time, aliasing it as "prev_time"""
         """Calculates the time difference between current and previous open_time, divides by 60000 (converts milliseconds to minutes), aliases as "gap_minutes"""
         query = """
         SELECT open_time, 
-               LAG(open_time) OVER (ORDER BY open_time) as prev_time,
-               (open_time - LAG(open_time) OVER (ORDER BY open_time)) / 60000 as gap_minutes
+            LAG(open_time) OVER (ORDER BY CAST(open_time AS bigint)) as prev_time,
+            (CAST(open_time AS bigint) - LAG(CAST(open_time AS bigint)) OVER (ORDER BY CAST(open_time AS bigint))) / 60000 as gap_minutes
         FROM crypto_data 
         WHERE symbol = %s 
-        ORDER BY open_time
+        ORDER BY CAST(open_time AS bigint)
         """
 
-        db_conn = DBConnections()
-        with db_conn as conn:
+        with self.get_db_connection() as conn:
             df = pd.read_sql(query, conn, params=[symbol])
         
         # Find gaps larger than expected interval
@@ -103,8 +62,7 @@ class DataQualityAssessment(DBConnections):
         ORDER BY open_time
         """
         
-        db_conn = DBConnections()
-        with db_conn as conn:
+        with self.get_db_connection() as conn:
             df = pd.read_sql(query, conn, params=[symbol])
         
         outliers = {}
@@ -133,19 +91,18 @@ class DataQualityAssessment(DBConnections):
         SELECT 
             symbol,
             COUNT(*) as record_count,
-            MIN(open_time) as earliest_time,
-            MAX(open_time) as latest_time,
+            MIN(CAST(open_time AS bigint)) as earliest_time,
+            MAX(CAST(open_time AS bigint)) as latest_time,
             COUNT(CASE WHEN close_price IS NULL THEN 1 END) as null_prices,
             COUNT(CASE WHEN volume IS NULL THEN 1 END) as null_volumes
         FROM crypto_data 
         GROUP BY symbol
         """
         
-        db_conn = DBConnections()
-        with db_conn as conn:
+        with self.get_db_connection() as conn:
             df = pd.read_sql(query, conn)
         
-        # Calculate time span for each symbol
+        # Calculate time span for each symbol (now both columns are numeric)
         df['time_span_hours'] = (df['latest_time'] - df['earliest_time']) / (1000 * 3600)
         df['expected_records'] = df['time_span_hours']  # 1 record per hour
         df['completeness_ratio'] = df['record_count'] / df['expected_records']

@@ -7,3 +7,4 @@ pandas
 numpy
 prometheus_client
 seaborn
+mlflow

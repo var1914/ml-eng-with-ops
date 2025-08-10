@@ -3,12 +3,55 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
+from io import BytesIO
+
+
+from minio import Minio
+from minio.error import S3Error
+
+# MinIO Configuration
+MINIO_CONFIG = {
+    'endpoint': 'minio:9000',  # Adjust based on your Helm setup
+    'access_key': 'admin',  # Change these in production!
+    'secret_key': 'admin123',
+    'secure': False  # Set to True if using HTTPS
+}
+
+BUCKET_NAME = 'crypto-features'
 
 class FeatureEngineeringPipeline:
     def __init__(self, db_config):
-        self.db_config = db_config
         self.logger = logging.getLogger("feature_engineering")
+        self.db_config = db_config
+        self.minio_client = self._get_minio_client()
+        self._ensure_bucket_exists()
     
+    def _get_minio_client(self):
+        try:
+            client = Minio(
+                MINIO_CONFIG['endpoint'],
+                access_key=MINIO_CONFIG['access_key'],
+                secret_key=MINIO_CONFIG['secret_key'],
+                secure=MINIO_CONFIG['secure']
+            )
+            self.logger.info(f"MinIO Client Initialised")
+            return client
+        except Exception as e:
+            self.logger.error(f"Failed to initialise MinIO Client: {str(e)}")
+            raise
+
+    def _ensure_bucket_exists(self):
+        """Create bucket if it doesn't exist"""
+        try:
+            if not self.minio_client.bucket_exists(BUCKET_NAME):
+                self.minio_client.make_bucket(BUCKET_NAME)
+                self.logger.info(f"Created bucket: {BUCKET_NAME}")
+            else:
+                self.logger.info(f"Bucket {BUCKET_NAME} already exists")
+        except S3Error as e:
+            self.logger.error(f"Error with bucket operations: {str(e)}")
+            raise
+
     def get_db_connection(self):
         return psycopg2.connect(**self.db_config)
     
@@ -238,7 +281,7 @@ class FeatureEngineeringPipeline:
         results = {
             'pipeline_time': datetime.now().isoformat(),
             'symbols_processed': [],
-            'feature_data': {}
+            'storage_paths': {}
         }
         
         # Step 1: Individual symbol features
@@ -265,9 +308,29 @@ class FeatureEngineeringPipeline:
             for col in new_cross_features:
                 combined[col] = cross_features[symbol][col]
             
-            results['feature_data'][symbol] = combined
+            # Save to MinIO
+            date_partition = datetime.now().strftime('%Y%m%d')
+            object_name = f"features/{date_partition}/{symbol}.parquet"
+        
+            # Convert DataFrame to parquet bytes
+            parquet_buffer = BytesIO()
+            combined.to_parquet(parquet_buffer, index=True)
+            parquet_buffer.seek(0)
+            
+            # Upload to MinIO
+            self.minio_client.put_object(
+                bucket_name=BUCKET_NAME,
+                object_name=object_name,
+                data=parquet_buffer,
+                length=len(parquet_buffer.getvalue()),
+                content_type='application/octet-stream'
+            )
+            
+            results['storage_paths'][symbol] = object_name
+            self.logger.info(f"Saved features for {symbol} to MinIO: {object_name}")
         
         return results
+
 
 # Usage example:
 """

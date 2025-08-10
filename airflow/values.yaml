@@ -4,7 +4,7 @@
 images:
   airflow:
     repository: localhost:5050/custom-airflow
-    tag: latest
+    tag: 0.0.2
     pullPolicy: Always
 
 dags:
