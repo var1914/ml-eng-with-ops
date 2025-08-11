@@ -15,17 +15,13 @@ import base64
 from data_quality import DataQualityAssessment
 from feature_eng import FeatureEngineeringPipeline
 
-DB_CONFIG = {
-    "dbname": "postgres",
-    "user": "varunrajput", 
-    "password": "yourpassword",
-    "host": "host.docker.internal",
-    "port": "5432"
-}
+from minio import Minio
+from minio.error import S3Error
 
 # Keep your existing imports and constants
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT', 'XRPUSDT', 'DOTUSDT', 'AVAXUSDT', 'MATICUSDT', 'LINKUSDT']
 BASE_URL = "https://api.binance.com/api/v3/klines"
+BUCKET_NAME = 'crypto-features'
 
 # MinIO Configuration
 MINIO_CONFIG = {
@@ -36,14 +32,44 @@ MINIO_CONFIG = {
 }
 
 class MLMonitoringIntegration:
-    def __init__(self, mlflow_tracking_uri="http://mlflow.default:5000", 
+    def __init__(self, mlflow_tracking_uri="http://mlflow-tracking", 
                  prometheus_gateway="http://pushgateway-prometheus-pushgateway.ml-monitoring:9091"):
         self.mlflow_tracking_uri = mlflow_tracking_uri
+        self.artifact_bucket = BUCKET_NAME
         self.prometheus_gateway = prometheus_gateway
         self.logger = logging.getLogger("ml_monitoring")
         
         # Setup MLflow
         mlflow.set_tracking_uri(mlflow_tracking_uri)
+
+        self.minio_client = self._get_minio_client()
+        self._ensure_bucket_exists()
+    
+    def _get_minio_client(self):
+        try:
+            client = Minio(
+                MINIO_CONFIG['endpoint'],
+                access_key=MINIO_CONFIG['access_key'],
+                secret_key=MINIO_CONFIG['secret_key'],
+                secure=MINIO_CONFIG['secure']
+            )
+            self.logger.info(f"MinIO Client Initialised")
+            return client
+        except Exception as e:
+            self.logger.error(f"Failed to initialise MinIO Client: {str(e)}")
+            raise
+
+    def _ensure_bucket_exists(self):
+        """Create bucket if it doesn't exist"""
+        try:
+            if not self.minio_client.bucket_exists(self.artifact_bucket):
+                self.minio_client.make_bucket(self.artifact_bucket)
+                self.logger.info(f"Created bucket: {self.artifact_bucket}")
+            else:
+                self.logger.info(f"Bucket {self.artifact_bucket} already exists")
+        except S3Error as e:
+            self.logger.error(f"Error with bucket operations: {str(e)}")
+            raise
         
         # Setup Prometheus metrics
         self.registry = CollectorRegistry()
@@ -97,61 +123,120 @@ class MLMonitoringIntegration:
         )
 
 class DataQualityMonitoring(MLMonitoringIntegration):
-    def __init__(self, db_config, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.db_config = db_config
         
     def log_data_quality_metrics(self, quality_results, symbols):
         """Log data quality results to MLflow and Prometheus"""
+
+        # Clean up any existing MLflow state
+        try:
+            mlflow.end_run()
+        except:
+            pass
         
-        # Start MLflow experiment
+        # Check if experiment exists, create if not
         experiment_name = "data_quality_assessment"
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+                self.logger.info(f"Created new MLflow experiment: {experiment_name}")
+            else:
+                self.logger.info(f"Using existing MLflow experiment: {experiment_name}")
+        except Exception as e:
+            self.logger.warning(f"Error checking MLflow experiment: {e}, creating new one")
+            mlflow.create_experiment(experiment_name)
+
         mlflow.set_experiment(experiment_name)
+
+        # Start fresh run
+        run = mlflow.start_run(run_name=f"dq_assessment_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_id = run.info.run_id
         
-        with mlflow.start_run(run_name=f"dq_assessment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+        try:
+            self.logger.info(f"Started MLflow run: {run_id}")
             
             # Log overall completeness
             overall_completeness = quality_results['completeness']['avg_completeness']
             mlflow.log_metric("overall_completeness_ratio", overall_completeness)
+            self.logger.info("Logged overall completeness")
             
             # Log per-symbol metrics
             for symbol in symbols:
-                # Completeness
+                # Your existing metric logging code...
                 symbol_completeness = next(
                     (s['completeness_ratio'] for s in quality_results['completeness']['completeness_summary'] 
-                     if s['symbol'] == symbol), 0
+                    if s['symbol'] == symbol), 0
                 )
                 mlflow.log_metric(f"completeness_{symbol}", symbol_completeness)
                 self.dq_completeness_ratio.labels(symbol=symbol).set(symbol_completeness)
                 
-                # Gaps
                 gaps_count = quality_results['timestamp_continuity'][symbol]['gaps_found']
                 mlflow.log_metric(f"gaps_{symbol}", gaps_count)
                 self.dq_gaps_count.labels(symbol=symbol).set(gaps_count)
                 
-                # Outliers
                 outliers_count = quality_results['outlier_detection'][symbol]['total_outliers']
                 mlflow.log_metric(f"outliers_{symbol}", outliers_count)
                 self.dq_outliers_count.labels(symbol=symbol).set(outliers_count)
+                
+                self.logger.info(f"Logged metrics for symbol: {symbol}")
             
-            # Create and log visualizations
-            self._create_dq_visualizations(quality_results, symbols)
+            # Create visualizations and save to MinIO directly
+            try:
+                self.logger.info("Starting visualization creation")
+                self._create_dq_visualizations(quality_results, symbols, run_id)
+                self.logger.info("Completed visualization creation")
+            except Exception as viz_error:
+                self.logger.error(f"Visualization creation failed: {viz_error}")
             
-            # Log raw results as artifact
-            mlflow.log_dict(quality_results, "data_quality_results.json")
+            # Save raw results to MinIO directly
+            try:
+                self._save_results_to_minio(quality_results, run_id)
+                self.logger.info("Saved raw results to MinIO")
+            except Exception as save_error:
+                self.logger.error(f"Failed to save results to MinIO: {save_error}")
             
             # Update pipeline counter
             self.pipeline_runs_total.labels(pipeline_type="data_quality", status="success").inc()
             
+        except Exception as mlflow_error:
+            self.logger.error(f"MLflow logging failed: {mlflow_error}")
+            raise
+        finally:
+            # Explicitly end the run
+            try:
+                mlflow.end_run()
+                self.logger.info("Ended MLflow run")
+            except Exception as e:
+                self.logger.warning(f"Error ending MLflow run: {e}")
+        
         # Push metrics to Prometheus
         try:
             push_to_gateway(self.prometheus_gateway, job='ml_data_quality', 
-                          registry=self.registry)
+                        registry=self.registry)
             self.logger.info("Pushed data quality metrics to Prometheus")
         except Exception as e:
             self.logger.error(f"Failed to push to Prometheus: {e}")
+
+    def _save_results_to_minio(self, quality_results, run_id):
+        """Save quality results JSON to MinIO"""
+        
+        # Convert to JSON bytes
+        json_data = json.dumps(quality_results, indent=2, default=str)
+        json_buffer = BytesIO(json_data.encode('utf-8'))
+        
+        # Save to MinIO
+        object_name = f"mlflow-runs/{run_id}/artifacts/data_quality_results.json"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=json_buffer,
+            length=len(json_data.encode('utf-8')),
+            content_type='application/json'
+        )
     
-    def _create_dq_visualizations(self, quality_results, symbols):
+    def _create_dq_visualizations(self, quality_results, symbols, run_id):
         """Create data quality visualizations"""
         
         # 1. Completeness Overview
@@ -215,8 +300,22 @@ class DataQualityMonitoring(MLMonitoringIntegration):
         axes[1,1].tick_params(axis='x', rotation=45)
         
         plt.tight_layout()
-        mlflow.log_figure(fig, "data_quality_overview.png")
+        # Save to MinIO instead of MLflow
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/data_quality_overview.png"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
         plt.close()
+        self.logger.info(f"Saved visualization to MinIO: {object_name}")
 
 class FeatureEngineeringMonitoring(MLMonitoringIntegration):
     def __init__(self, **kwargs):
@@ -225,15 +324,41 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
     def log_feature_engineering_metrics(self, feature_results, symbols):
         """Log feature engineering results to MLflow and Prometheus"""
         
+        # Clean up any existing MLflow state
+        try:
+            mlflow.end_run()
+        except:
+            pass
+        
+        # Check if experiment exists, create if not
         experiment_name = "feature_engineering"
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+                self.logger.info(f"Created new MLflow experiment: {experiment_name}")
+            else:
+                self.logger.info(f"Using existing MLflow experiment: {experiment_name}")
+        except Exception as e:
+            self.logger.warning(f"Error checking MLflow experiment: {e}, creating new one")
+            mlflow.create_experiment(experiment_name)
+
         mlflow.set_experiment(experiment_name)
         
-        with mlflow.start_run(run_name=f"fe_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+        # Start fresh run
+        run = mlflow.start_run(run_name=f"fe_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_id = run.info.run_id
+        
+        try:
+            self.logger.info(f"Started MLflow run: {run_id}")
             
             # Log per-symbol feature metrics
             for symbol in symbols:
-                features_df = feature_results['feature_data'][symbol]
-                
+                parquet_file_path = feature_results['storage_paths'][symbol]
+                response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+                features_df = pd.read_parquet(BytesIO(response.read()))
+                response.close()
+                response.release_conn()
                 # Basic metrics
                 total_features = len(features_df.columns)
                 total_records = len(features_df)
@@ -268,13 +393,31 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
                 mlflow.log_metric(f"high_correlation_pairs_{symbol}", len(high_corr_pairs))
                 
             # Create visualizations
-            self._create_fe_visualizations(feature_results, symbols)
+            self._create_fe_visualizations(feature_results, symbols, run_id)
             
             # Log feature importance (if available)
-            self._log_feature_statistics(feature_results, symbols)
+            self._log_feature_statistics(feature_results, symbols, run_id)
+            
+            # Save raw results to MinIO directly
+            try:
+                self._save_results_to_minio(feature_results, run_id)
+                self.logger.info("Saved raw results to MinIO")
+            except Exception as save_error:
+                self.logger.error(f"Failed to save results to MinIO: {save_error}")
             
             # Update pipeline counter
             self.pipeline_runs_total.labels(pipeline_type="feature_engineering", status="success").inc()
+
+        except Exception as mlflow_error:
+            self.logger.error(f"MLflow logging failed: {mlflow_error}")
+            raise
+        finally:
+            # Explicitly end the run
+            try:
+                mlflow.end_run()
+                self.logger.info("Ended MLflow run")
+            except Exception as e:
+                self.logger.warning(f"Error ending MLflow run: {e}")
         
         # Push to Prometheus
         try:
@@ -284,6 +427,23 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
         except Exception as e:
             self.logger.error(f"Failed to push to Prometheus: {e}")
     
+    def _save_results_to_minio(self, feature_results, run_id):
+        """Save quality results JSON to MinIO"""
+        
+        # Convert to JSON bytes
+        json_data = json.dumps(feature_results, indent=2, default=str)
+        json_buffer = BytesIO(json_data.encode('utf-8'))
+        
+        # Save to MinIO
+        object_name = f"mlflow-runs/{run_id}/artifacts/feature_engineering_results.json"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=json_buffer,
+            length=len(json_data.encode('utf-8')),
+            content_type='application/json'
+        )
+
     def _categorize_features(self, columns):
         """Categorize features by type"""
         categories = {
@@ -332,24 +492,34 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
                     ))
         return high_corr_pairs
     
-    def _create_fe_visualizations(self, feature_results, symbols):
+    def _create_fe_visualizations(self, feature_results, symbols, run_id):
         """Create feature engineering visualizations"""
         
         # Feature count comparison
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         
-        # 1. Feature count by symbol
+        # 1. Feature count by symbol - FIX THIS
         feature_counts = []
         for symbol in symbols:
-            feature_counts.append(len(feature_results['feature_data'][symbol].columns))
+            parquet_file_path = feature_results['storage_paths'][symbol]
+            response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+            df = pd.read_parquet(BytesIO(response.read()))
+            response.close()
+            response.release_conn()
+            feature_counts.append(len(df.columns))  # Now df has .columns
         
         axes[0,0].bar(symbols, feature_counts)
         axes[0,0].set_title('Feature Count by Symbol')
         axes[0,0].set_ylabel('Number of Features')
         
-        # 2. Feature type distribution (using first symbol as example)
+        # 2. Feature type distribution - FIX THIS
         first_symbol = symbols[0]
-        feature_types = self._categorize_features(feature_results['feature_data'][first_symbol].columns)
+        parquet_file_path = feature_results['storage_paths'][first_symbol]
+        response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+        first_df = pd.read_parquet(BytesIO(response.read()))
+        response.close()
+        response.release_conn()
+        feature_types = self._categorize_features(first_df.columns)
         
         axes[0,1].pie(feature_types.values(), labels=feature_types.keys(), autopct='%1.1f%%')
         axes[0,1].set_title(f'Feature Type Distribution ({first_symbol})')
@@ -357,7 +527,11 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
         # 3. Null value heatmap
         null_data = []
         for symbol in symbols:
-            df = feature_results['feature_data'][symbol]
+            parquet_file_path = feature_results['storage_paths'][symbol]
+            response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+            df = pd.read_parquet(BytesIO(response.read()))
+            response.close()
+            response.release_conn()
             null_pct = (df.isnull().sum() / len(df) * 100).mean()
             null_data.append(null_pct)
         
@@ -368,7 +542,11 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
         # 4. Feature correlation summary
         high_corr_counts = []
         for symbol in symbols:
-            df = feature_results['feature_data'][symbol]
+            parquet_file_path = feature_results['storage_paths'][symbol]
+            response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+            df = pd.read_parquet(BytesIO(response.read()))
+            response.close()
+            response.release_conn()
             corr_matrix = df.select_dtypes(include=[np.number]).corr()
             high_corr_pairs = self._find_high_correlations(corr_matrix)
             high_corr_counts.append(len(high_corr_pairs))
@@ -378,66 +556,90 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
         axes[1,1].set_ylabel('Number of High Corr Pairs (>0.8)')
         
         plt.tight_layout()
-        mlflow.log_figure(fig, "feature_engineering_overview.png")
+        # Save to MinIO instead of MLflow
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/feature_engineering_overview.png"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
         plt.close()
+        self.logger.info(f"Saved visualization to MinIO: {object_name}")
         
         # Create detailed correlation heatmap for first symbol
-        self._create_correlation_heatmap(feature_results['feature_data'][symbols[0]], symbols[0])
+        parquet_file_path = feature_results['storage_paths'][symbols[0]]
+        response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+        first_symbol_df = pd.read_parquet(BytesIO(response.read()))
+        response.close()
+        response.release_conn()
+        self._create_correlation_heatmap(first_symbol_df, symbols[0], run_id)
     
-    def _create_correlation_heatmap(self, df, symbol):
+    def _create_correlation_heatmap(self, df, symbol, run_id):
         """Create correlation heatmap for features"""
         # Select subset of features for readability
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         sample_cols = numeric_cols[:20] if len(numeric_cols) > 20 else numeric_cols
         
-        plt.figure(figsize=(12, 10))
+        fig = plt.figure(figsize=(12, 10))
         corr_matrix = df[sample_cols].corr()
         
         mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
         sns.heatmap(corr_matrix, mask=mask, annot=True, fmt='.2f', 
-                   cmap='coolwarm', center=0, square=True)
+                cmap='coolwarm', center=0, square=True)
         plt.title(f'Feature Correlation Matrix - {symbol} (Sample)')
         plt.tight_layout()
         
-        mlflow.log_figure(plt.gcf(), f"correlation_matrix_{symbol}.png")
+        # Save to MinIO instead of MLflow
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/correlation_matrix_{symbol}.png"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
         plt.close()
+        self.logger.info(f"Saved correlation heatmap to MinIO: {object_name}")
     
-    def _log_feature_statistics(self, feature_results, symbols):
+    def _log_feature_statistics(self, feature_results, symbols, run_id):
         """Log detailed feature statistics"""
         for symbol in symbols:
-            df = feature_results['feature_data'][symbol]
+            parquet_file_path = feature_results['storage_paths'][symbol]
+            response = self.minio_client.get_object(self.artifact_bucket, parquet_file_path)
+            df = pd.read_parquet(BytesIO(response.read()))
+            response.close()
+            response.release_conn()
             
             # Basic statistics for numeric features
             numeric_df = df.select_dtypes(include=[np.number])
             stats = numeric_df.describe()
             
-            # Log as artifact
+            # Save to MinIO instead of MLflow
             stats_dict = stats.to_dict()
-            mlflow.log_dict(stats_dict, f"feature_statistics_{symbol}.json")
+            json_data = json.dumps(stats_dict, indent=2, default=str)
+            json_buffer = BytesIO(json_data.encode('utf-8'))
+            
+            object_name = f"mlflow-runs/{run_id}/artifacts/feature_statistics_{symbol}.json"
+            self.minio_client.put_object(
+                bucket_name=self.artifact_bucket,
+                object_name=object_name,
+                data=json_buffer,
+                length=len(json_data.encode('utf-8')),
+                content_type='application/json'
+            )
             
             # Log key statistics as metrics
             mlflow.log_metric(f"feature_mean_std_{symbol}", stats.loc['std'].mean())
             mlflow.log_metric(f"feature_mean_skew_{symbol}", numeric_df.skew().mean())
-
-# Usage example:
-# Initialize monitoring
-dq_monitor = DataQualityMonitoring(
-    db_config=DB_CONFIG,
-    mlflow_tracking_uri="http://mlflow.default:5000",
-    prometheus_gateway="http://pushgateway-prometheus-pushgateway.ml-monitoring:9091"
-)
-
-fe_monitor = FeatureEngineeringMonitoring(
-    mlflow_tracking_uri="http://mlflow.default:5000",
-    prometheus_gateway="http://pushgateway-prometheus-pushgateway.ml-monitoring:9091"
-)
-
-# Run data quality assessment and log results
-assessor = DataQualityAssessment(DB_CONFIG)
-quality_results = assessor.run_quality_assessment(SYMBOLS)
-dq_monitor.log_data_quality_metrics(quality_results, SYMBOLS)
-
-# Run feature engineering and log results  
-pipeline = FeatureEngineeringPipeline(DB_CONFIG)
-feature_results = pipeline.run_feature_pipeline(SYMBOLS)
-fe_monitor.log_feature_engineering_metrics(feature_results, SYMBOLS)
