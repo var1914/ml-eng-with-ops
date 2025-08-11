@@ -1,0 +1,53 @@
+# # MLflow Tracking Server Configuration
+tracking:
+  # Enable the tracking server
+  enabled: true
+  # Number of replicas
+  replicaCount: 1
+  
+  # Authentication Configuration
+  auth:
+    # Enable basic authentication
+    enabled: false
+
+service:
+  # Set service type to ClusterIP (NOT LoadBalancer)
+  type: ClusterIP
+  ports:
+    http: 5000
+
+minio:
+  enabled: false
+
+# Database Configuration (PostgreSQL backend)
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: "mlflow123"
+    database: "mlflowdb"
+    username: "mlflow"
+    password: "mlflow123"
+  primary:
+    persistence:
+      enabled: true
+      size: 10Gi
+
+# Persistent Volume for MLflow data
+persistence:
+  enabled: true
+  size: 5Gi
+  accessModes:
+    - ReadWriteOnce
+
+# Environment Variables for S3/MinIO Configuration
+extraEnvVars:
+  - name: MLFLOW_S3_ENDPOINT_URL
+    value: "http://minio:9000"  # Replace with your MinIO service endpoint
+  - name: MLFLOW_S3_IGNORE_TLS
+    value: "true"
+  - name: AWS_ACCESS_KEY_ID
+    value: "admin"  # Replace with your MinIO access key
+  - name: AWS_SECRET_ACCESS_KEY
+    value: "admin123"  # Replace with your MinIO secret key
+
+defaultArtifactRoot: "s3://mlflow-artifacts"
