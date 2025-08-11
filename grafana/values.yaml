@@ -1,0 +1,47 @@
+grafana:
+  adminPassword: admin123
+  service:
+    type: NodePort
+    nodePort: 30001
+  
+  # Enable sidecar to watch for dashboard ConfigMaps
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      folder: /tmp/dashboards
+      searchNamespace: ml-monitoring
+    
+  # Enable dashboard provisioning  
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+      - name: 'default'
+        orgId: 1
+        folder: 'ML Monitoring'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /tmp/dashboards
+
+prometheus:
+  prometheusSpec:
+    # Fix: Move additionalScrapeConfigs under prometheusSpec
+    additionalScrapeConfigs:
+      - job_name: 'pushgateway'
+        static_configs:
+          - targets: ['pushgateway-prometheus-pushgateway:9091']
+        scrape_interval: 15s
+        honor_labels: true  # Critical for pushgateway
+        metrics_path: /metrics
+        scrape_timeout: 10s
+
+# Fix for Docker Desktop node-exporter mount issue
+prometheus-node-exporter:
+  hostRootFsMount:
+    enabled: false
+  # Keep these enabled for basic monitoring
+  hostNetwork: true
+  hostPID: true
