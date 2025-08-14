@@ -10,6 +10,7 @@ from data_quality import DataQualityAssessment
 from feature_eng import FeatureEngineeringPipeline
 from viz import DataQualityMonitoring, FeatureEngineeringMonitoring
 from data_versioning import DVCDataVersioning, dvc_version_raw_data, dvc_version_features_data
+from automated_data_validation import validate_raw_data, validate_feature_data
 
 DB_CONFIG = {
     "dbname": "postgres",
@@ -23,6 +24,82 @@ SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT', 'XRPUSDT', 'DO
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 logger = logging.getLogger(__name__)
+
+def run_raw_data_validation(**context):
+    """Validate raw data quality"""
+    try:
+        
+        logger.info("Starting raw data validation...")
+        validation_results = validate_raw_data(DB_CONFIG, SYMBOLS)
+        
+        # Check for critical failures
+        critical_failures = []
+        total_warnings = 0
+        
+        for symbol, result in validation_results.items():
+            if result['critical_failures'] > 0:
+                critical_failures.append(f"{symbol}: {result['critical_failures']} critical issues")
+            total_warnings += result['warnings']
+        
+        # Log summary
+        logger.info(f"Raw data validation completed for {len(validation_results)} symbols")
+        logger.info(f"Total warnings: {total_warnings}")
+        
+        if critical_failures:
+            logger.error(f"Critical validation failures: {critical_failures}")
+            # You can choose to fail the task or just warn
+            # raise ValueError(f"Critical data validation failures: {critical_failures}")
+        
+        # Push results to XCom
+        context['task_instance'].xcom_push(key='raw_data_validation', value=validation_results)
+        
+        return validation_results
+        
+    except Exception as e:
+        logger.error(f"Raw data validation failed: {str(e)}")
+        raise
+
+def run_feature_data_validation(**context):
+    """Validate feature data quality"""
+    try:
+        
+        # Get feature results from upstream task
+        feature_results = context['task_instance'].xcom_pull(
+            task_ids='feature_engineering', 
+            key='feature_results'
+        )
+        
+        if not feature_results:
+            raise ValueError("No feature results found for validation")
+        
+        logger.info("Starting feature data validation...")
+        validation_results = validate_feature_data(DB_CONFIG, feature_results)
+        
+        # Check for critical failures
+        critical_failures = []
+        total_warnings = 0
+        
+        for symbol, result in validation_results.items():
+            if result['critical_failures'] > 0:
+                critical_failures.append(f"{symbol}: {result['critical_failures']} critical issues")
+            total_warnings += result['warnings']
+        
+        # Log summary
+        logger.info(f"Feature validation completed for {len(validation_results)} symbols")
+        logger.info(f"Total warnings: {total_warnings}")
+        
+        if critical_failures:
+            logger.error(f"Critical feature validation failures: {critical_failures}")
+        
+        # Push results to XCom
+        context['task_instance'].xcom_push(key='feature_data_validation', value=validation_results)
+        
+        return validation_results
+        
+    except Exception as e:
+        logger.error(f"Feature data validation failed: {str(e)}")
+        raise
+
 
 def run_data_quality_assessment(**context):
     """Run data quality assessment and return results via XCom"""
@@ -157,9 +234,21 @@ data_quality_task = PythonOperator(
     retries=1,
 )
 
+raw_data_validation_task = PythonOperator(
+    task_id='raw_data_validation',
+    python_callable=run_raw_data_validation,
+    dag=dag,
+)
+
 feature_engineering_task = PythonOperator(
     task_id='feature_engineering',
     python_callable=run_feature_engineering,
+    dag=dag,
+)
+
+feature_data_validation_task = PythonOperator(
+    task_id='feature_data_validation',
+    python_callable=run_feature_data_validation,
     dag=dag,
 )
 
@@ -177,4 +266,4 @@ monitoring_task = PythonOperator(
 )
 
 # Define task dependencies - updated to include versioning
-data_quality_task >> feature_engineering_task >> data_versioning_task >> monitoring_task
+data_quality_task >> raw_data_validation_task >> feature_engineering_task >> feature_data_validation_task >> data_versioning_task >> monitoring_task
