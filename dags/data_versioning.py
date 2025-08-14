@@ -53,7 +53,7 @@ class DVCDataVersioning:
         self.logger = logging.getLogger("dvc_data_versioning")
         self.db_config = db_config
         self.data_dir = Path(data_dir or DVC_CONFIG['data_dir'])
-        self.git_repo_path = git_repo_path or "/opt/airflow/dags"  # Your DAGs directory
+        self.git_repo_path = git_repo_path or "/opt/airflow"  # Your DAGs directory
         
         # Ensure directories exist
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +64,8 @@ class DVCDataVersioning:
         self._setup_dvc()
         self._create_metadata_table()
         self.minio_client = self._get_minio_client()
+        self.dvc_bucket = "crypto-data-versions"
+        self._ensure_bucket_exists()
     
     def _get_minio_client(self):
         try:
@@ -79,14 +81,34 @@ class DVCDataVersioning:
             self.logger.error(f"Failed to initialise MinIO Client: {str(e)}")
             raise
 
+    def _ensure_bucket_exists(self):
+        """Create bucket if it doesn't exist"""
+        try:
+            if not self.minio_client.bucket_exists(self.dvc_bucket):
+                self.minio_client.make_bucket(self.dvc_bucket)
+                self.logger.info(f"Created bucket: {self.dvc_bucket}")
+            else:
+                self.logger.info(f"Bucket {self.dvc_bucket} already exists")
+        except S3Error as e:
+            self.logger.error(f"Error with bucket operations: {str(e)}")
+            raise
+
+
     def _setup_dvc(self):
         """Initialize DVC repository and remote storage"""
-        os.chdir(self.git_repo_path)
-        
+        # Ensure we're in the right directory and have permissions
         try:
+            # Create git repo path if it doesn't exist
+            os.makedirs(self.git_repo_path, exist_ok=True)
+            os.chdir(self.git_repo_path)
+            
+            # Check if DVC is available
+            if not self._check_dvc_available():
+                raise RuntimeError("DVC is not installed or not in PATH")
+            
             # Initialize DVC if not already done
             if not os.path.exists('.dvc'):
-                self._run_command(['dvc', 'init', '--no-scm'])
+                self._run_command(['dvc', 'init'])
                 self.logger.info("DVC repository initialized")
             
             # Configure remote storage
@@ -94,7 +116,22 @@ class DVCDataVersioning:
             
         except Exception as e:
             self.logger.error(f"DVC setup failed: {str(e)}")
-            raise
+            # Don't raise here - fall back to MinIO-only versioning
+            self.logger.warning("Falling back to MinIO-only versioning without DVC")
+
+    def _check_dvc_available(self):
+        """Check if DVC command is available"""
+        try:
+            result = subprocess.run(['which', 'dvc'], capture_output=True, text=True)
+            if result.returncode == 0:
+                self.logger.info(f"DVC found at: {result.stdout.strip()}")
+                return True
+            else:
+                self.logger.warning("DVC command not found in PATH")
+                return False
+        except Exception as e:
+            self.logger.warning(f"Cannot check DVC availability: {e}")
+            return False
 
     def _setup_remote_storage(self):
         """Configure DVC remote storage (S3 or MinIO)"""
@@ -111,21 +148,18 @@ class DVCDataVersioning:
                     DVC_CONFIG['remote_url']
                 ])
                 
-                # Configure MinIO if using MinIO instead of S3
-                if 'minio' in DVC_CONFIG['remote_url'] or 'localhost' in DVC_CONFIG['remote_url']:
-                    self._run_command([
-                        'dvc', 'remote', 'modify', DVC_CONFIG['remote_name'], 
-                        'endpointurl', 'http://minio:9000'
-                    ])
-                    self._run_command([
-                        'dvc', 'remote', 'modify', DVC_CONFIG['remote_name'], 
-                        'access_key_id', 'admin'
-                    ])
-                    self._run_command([
-                        'dvc', 'remote', 'modify', DVC_CONFIG['remote_name'], 
-                        'secret_access_key', 'admin123'
-                    ])
-                
+                self._run_command([
+                    'dvc', 'remote', 'modify', DVC_CONFIG['remote_name'], 
+                    'endpointurl', 'http://minio:9000'
+                ])
+                self._run_command([
+                    'dvc', 'remote', 'modify', DVC_CONFIG['remote_name'], 
+                    'access_key_id', 'admin'
+                ])
+                self._run_command([
+                    'dvc', 'remote', 'modify', DVC_CONFIG['remote_name'], 
+                    'secret_access_key', 'admin123'
+                ])
                 self.logger.info(f"DVC remote '{DVC_CONFIG['remote_name']}' configured")
             
         except Exception as e:
@@ -200,10 +234,10 @@ class DVCDataVersioning:
         if len(numeric_cols) > 0:
             schema['numeric_stats'] = {
                 col: {
-                    'mean': float(df[col].mean()),
-                    'std': float(df[col].std()),
-                    'min': float(df[col].min()),
-                    'max': float(df[col].max()),
+                    'mean': float(df[col].mean()) if not pd.isna(df[col].mean()) else None,
+                    'std': float(df[col].std()) if not pd.isna(df[col].std()) else None,
+                    'min': float(df[col].min()) if not pd.isna(df[col].min()) else None,
+                    'max': float(df[col].max()) if not pd.isna(df[col].max()) else None,
                     'null_count': int(df[col].isnull().sum())
                 } for col in numeric_cols
             }
@@ -569,7 +603,7 @@ def dvc_version_features_data(db_config: Dict, feature_results: Dict) -> List[st
             
         except Exception as e:
             versioning.logger.warning(f"Could not version features for {symbol}: {e}")
-            continue
+            raise
     
     return version_ids
 

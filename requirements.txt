@@ -8,3 +8,7 @@ numpy
 prometheus_client
 seaborn
 mlflow
+dvc[s3]
+boto3
+botocore
+GitPython

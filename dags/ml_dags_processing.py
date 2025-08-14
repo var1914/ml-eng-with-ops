@@ -142,8 +142,8 @@ default_args = {
 }
 
 dag = DAG(
-    'crypto_ml_pipeline_with_versioning',
-    description='Complete Crypto ML pipeline with data versioning',
+    'crypto_ml_pipeline',
+    description='Complete Crypto ML pipeline',
     default_args=default_args,
     schedule='@hourly',
     catchup=False,
