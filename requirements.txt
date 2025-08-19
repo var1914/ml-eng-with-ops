@@ -12,3 +12,6 @@ dvc[s3]
 boto3
 botocore
 GitPython
+lightgbm
+xgboost
+scikit-learn
