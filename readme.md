@@ -1,4 +1,6 @@
-# ML Engineering with Ops: Crypto ML Pipeline
+# Final Work is in progress..
+
+## Crypto ML Pipeline
 
 This repository contains a production-grade ML pipeline for crypto data, featuring Airflow orchestration, DVC data versioning, MLflow model registry, and integrated monitoring with Prometheus and Grafana.
 
