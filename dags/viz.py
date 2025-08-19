@@ -15,6 +15,8 @@ import base64
 from data_quality import DataQualityAssessment
 from feature_eng import FeatureEngineeringPipeline
 
+import psycopg2
+
 from minio import Minio
 from minio.error import S3Error
 
@@ -44,6 +46,9 @@ class MLMonitoringIntegration:
 
         self.minio_client = self._get_minio_client()
         self._ensure_bucket_exists()
+        # Setup Prometheus metrics
+        self.registry = CollectorRegistry()
+        self._setup_prometheus_metrics()
     
     def _get_minio_client(self):
         try:
@@ -70,10 +75,6 @@ class MLMonitoringIntegration:
         except S3Error as e:
             self.logger.error(f"Error with bucket operations: {str(e)}")
             raise
-        
-        # Setup Prometheus metrics
-        self.registry = CollectorRegistry()
-        self._setup_prometheus_metrics()
         
     def _setup_prometheus_metrics(self):
         """Initialize Prometheus metrics"""
@@ -122,6 +123,44 @@ class MLMonitoringIntegration:
             ['pipeline_type', 'status'], registry=self.registry
         )
 
+        self.validation_pass_rate = Gauge(
+            'data_validation_pass_rate',
+            'Data validation pass rate by dataset',
+            ['dataset_name', 'symbol'], registry=self.registry
+        )
+        
+        self.validation_critical_failures = Gauge(
+            'data_validation_critical_failures',
+            'Number of critical validation failures',
+            ['dataset_name', 'symbol'], registry=self.registry
+        )
+        
+        self.validation_warnings = Gauge(
+            'data_validation_warnings',
+            'Number of validation warnings',
+            ['dataset_name', 'symbol'], registry=self.registry
+        )
+        
+        self.validation_runs_total = Counter(
+            'data_validation_runs_total',
+            'Total validation runs',
+            ['dataset_name', 'status'], registry=self.registry
+        )
+
+        # NEW: Overall pipeline health
+        self.pipeline_health_score = Gauge(
+            'ml_pipeline_health_score',
+            'Overall ML pipeline health score',
+            ['symbol'], registry=self.registry
+        )
+        
+        self.data_freshness_hours = Gauge(
+            'data_freshness_hours',
+            'Hours since latest data point',
+            ['symbol'], registry=self.registry
+        )
+
+      
 class DataQualityMonitoring(MLMonitoringIntegration):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -643,3 +682,301 @@ class FeatureEngineeringMonitoring(MLMonitoringIntegration):
             # Log key statistics as metrics
             mlflow.log_metric(f"feature_mean_std_{symbol}", stats.loc['std'].mean())
             mlflow.log_metric(f"feature_mean_skew_{symbol}", numeric_df.skew().mean())
+    
+
+# Extended monitoring class that includes validation
+class ValidationMonitoring(MLMonitoringIntegration):
+    def __init__(self, db_config, **kwargs):
+        super().__init__(**kwargs)
+        self.db_config = db_config
+    """Extended monitoring that includes validation monitoring"""
+    
+    def _create_validation_dashboard(self, raw_results, feature_results, symbols, run_id):
+        """Create comprehensive validation dashboard"""
+        
+        # Create 2x3 subplot layout
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # 1. Overall pass rates
+        raw_pass_rates = []
+        feature_pass_rates = []
+        
+        for symbol in symbols:
+            if raw_results and symbol in raw_results:
+                raw_rate = raw_results[symbol]['passed_rules'] / raw_results[symbol]['total_rules'] if raw_results[symbol]['total_rules'] > 0 else 0
+                raw_pass_rates.append(raw_rate * 100)
+            else:
+                raw_pass_rates.append(0)
+                
+            if feature_results and symbol in feature_results:
+                feature_rate = feature_results[symbol]['passed_rules'] / feature_results[symbol]['total_rules'] if feature_results[symbol]['total_rules'] > 0 else 0
+                feature_pass_rates.append(feature_rate * 100)
+            else:
+                feature_pass_rates.append(0)
+        
+        x = np.arange(len(symbols))
+        width = 0.35
+        
+        axes[0,0].bar(x - width/2, raw_pass_rates, width, label='Raw Data', alpha=0.8)
+        axes[0,0].bar(x + width/2, feature_pass_rates, width, label='Features', alpha=0.8)
+        axes[0,0].set_xlabel('Symbols')
+        axes[0,0].set_ylabel('Pass Rate (%)')
+        axes[0,0].set_title('Validation Pass Rates by Symbol')
+        axes[0,0].set_xticks(x)
+        axes[0,0].set_xticklabels(symbols, rotation=45)
+        axes[0,0].legend()
+        axes[0,0].set_ylim(0, 100)
+        
+        # 2. Critical failures heatmap
+        critical_data = []
+        for symbol in symbols:
+            raw_critical = raw_results[symbol]['critical_failures'] if raw_results and symbol in raw_results else 0
+            feature_critical = feature_results[symbol]['critical_failures'] if feature_results and symbol in feature_results else 0
+            critical_data.append([raw_critical, feature_critical])
+        
+        critical_df = pd.DataFrame(critical_data, columns=['Raw Data', 'Features'], index=symbols)
+        sns.heatmap(critical_df.T, annot=True, fmt='d', ax=axes[0,1], cmap='Reds', cbar_kws={'label': 'Critical Failures'})
+        axes[0,1].set_title('Critical Validation Failures')
+        
+        # 3. Warnings distribution
+        warning_data = []
+        for symbol in symbols:
+            raw_warnings = raw_results[symbol]['warnings'] if raw_results and symbol in raw_results else 0
+            feature_warnings = feature_results[symbol]['warnings'] if feature_results and symbol in feature_results else 0
+            warning_data.append([raw_warnings, feature_warnings])
+        
+        warning_df = pd.DataFrame(warning_data, columns=['Raw Data', 'Features'], index=symbols)
+        sns.heatmap(warning_df.T, annot=True, fmt='d', ax=axes[0,2], cmap='Oranges', cbar_kws={'label': 'Warnings'})
+        axes[0,2].set_title('Validation Warnings')
+        
+        # 4. Validation trend over time (last 7 days)
+        historical_data = self._get_validation_history(days=7)
+        if historical_data:
+            hist_df = pd.DataFrame(historical_data)
+            hist_df['validation_time'] = pd.to_datetime(hist_df['validation_time'])
+            hist_df['pass_rate'] = hist_df['passed_count'] / hist_df['rule_count']
+            
+            # Group by date and calculate average pass rate
+            daily_stats = hist_df.groupby(hist_df['validation_time'].dt.date)['pass_rate'].mean().reset_index()
+            
+            axes[1,0].plot(daily_stats['validation_time'], daily_stats['pass_rate'] * 100, marker='o')
+            axes[1,0].set_xlabel('Date')
+            axes[1,0].set_ylabel('Average Pass Rate (%)')
+            axes[1,0].set_title('Validation Trend (7 Days)')
+            axes[1,0].tick_params(axis='x', rotation=45)
+        else:
+            axes[1,0].text(0.5, 0.5, 'No Historical Data', ha='center', va='center', transform=axes[1,0].transAxes)
+            axes[1,0].set_title('Validation Trend (No Data)')
+        
+        # 5. Rule failure breakdown
+        rule_failures = {}
+        for symbol in symbols:
+            if raw_results and symbol in raw_results:
+                for result in raw_results[symbol]['results']:
+                    if not result['passed']:
+                        rule_name = result['rule_name']
+                        rule_failures[rule_name] = rule_failures.get(rule_name, 0) + 1
+            
+            if feature_results and symbol in feature_results:
+                for result in feature_results[symbol]['results']:
+                    if not result['passed']:
+                        rule_name = result['rule_name']
+                        rule_failures[rule_name] = rule_failures.get(rule_name, 0) + 1
+        
+        if rule_failures:
+            rules = list(rule_failures.keys())[:10]  # Top 10 failing rules
+            counts = [rule_failures[rule] for rule in rules]
+            
+            axes[1,1].barh(rules, counts)
+            axes[1,1].set_xlabel('Failure Count')
+            axes[1,1].set_title('Most Common Rule Failures')
+        else:
+            axes[1,1].text(0.5, 0.5, 'No Rule Failures', ha='center', va='center', transform=axes[1,1].transAxes)
+            axes[1,1].set_title('Rule Failures (None)')
+        
+        # 6. Overall health score
+        overall_scores = []
+        for symbol in symbols:
+            raw_score = raw_pass_rates[symbols.index(symbol)] if raw_results else 100
+            feature_score = feature_pass_rates[symbols.index(symbol)] if feature_results else 100
+            overall_score = (raw_score + feature_score) / 2
+            overall_scores.append(overall_score)
+        
+        colors = ['green' if s >= 90 else 'orange' if s >= 70 else 'red' for s in overall_scores]
+        axes[1,2].bar(symbols, overall_scores, color=colors, alpha=0.7)
+        axes[1,2].set_xlabel('Symbols')
+        axes[1,2].set_ylabel('Health Score (%)')
+        axes[1,2].set_title('Overall Data Health Score')
+        axes[1,2].tick_params(axis='x', rotation=45)
+        axes[1,2].set_ylim(0, 100)
+        
+        # Add horizontal lines for thresholds
+        axes[1,2].axhline(y=90, color='green', linestyle='--', alpha=0.5, label='Excellent')
+        axes[1,2].axhline(y=70, color='orange', linestyle='--', alpha=0.5, label='Good')
+        axes[1,2].legend()
+        
+        plt.tight_layout()
+        
+        # Save to MinIO
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/validation_dashboard.png"
+        self.minio_client.put_object(
+            bucket_name='crypto-features',
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
+        plt.close()
+        self.logger.info(f"Saved validation dashboard to MinIO: {object_name}")
+    
+    def _save_validation_summary(self, raw_results, feature_results, run_id):
+        """Save validation summary to MinIO"""
+        
+        summary = {
+            'timestamp': datetime.now().isoformat(),
+            'raw_data_validation': raw_results,
+            'feature_validation': feature_results,
+            'overall_stats': {
+                'total_symbols': len(set(list(raw_results.keys() if raw_results else []) + list(feature_results.keys() if feature_results else []))),
+                'total_critical_failures': sum(r['critical_failures'] for r in (raw_results or {}).values()) + sum(r['critical_failures'] for r in (feature_results or {}).values()),
+                'total_warnings': sum(r['warnings'] for r in (raw_results or {}).values()) + sum(r['warnings'] for r in (feature_results or {}).values())
+            }
+        }
+        
+        # Convert to JSON bytes
+        json_data = json.dumps(summary, indent=2, default=str)
+        json_buffer = BytesIO(json_data.encode('utf-8'))
+        
+        # Save to MinIO
+        object_name = f"mlflow-runs/{run_id}/artifacts/validation_summary.json"
+        self.minio_client.put_object(
+            bucket_name='crypto-features',
+            object_name=object_name,
+            data=json_buffer,
+            length=len(json_data.encode('utf-8')),
+            content_type='application/json'
+        )
+        
+        self.logger.info(f"Saved validation summary to MinIO: {object_name}")
+    
+    def _get_validation_history(self, days=7):
+        """Get validation history from database"""
+        query = """
+        SELECT dataset_name, symbol, validation_time, severity, 
+               COUNT(*) as rule_count,
+               SUM(CASE WHEN passed THEN 1 ELSE 0 END) as passed_count
+        FROM validation_results 
+        WHERE validation_time >= NOW() - INTERVAL '%s days'
+        GROUP BY dataset_name, symbol, validation_time, severity 
+        ORDER BY validation_time DESC
+        """
+        
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                df = pd.read_sql(query, conn, params=[days])
+            return df.to_dict('records')
+        except Exception as e:
+            self.logger.error(f"Failed to get validation history: {str(e)}")
+            return []
+
+    def log_validation_metrics(self, raw_validation_results, feature_validation_results, symbols, run_id):
+        """Log validation results to MLflow and Prometheus"""
+        
+        # Log raw data validation metrics
+        if raw_validation_results:
+            for symbol, result in raw_validation_results.items():
+                pass_rate = result['passed_rules'] / result['total_rules'] if result['total_rules'] > 0 else 0
+                
+                # MLflow metrics
+                mlflow.log_metric(f"raw_validation_pass_rate_{symbol}", pass_rate)
+                mlflow.log_metric(f"raw_validation_critical_{symbol}", result['critical_failures'])
+                mlflow.log_metric(f"raw_validation_warnings_{symbol}", result['warnings'])
+                
+                # Prometheus metrics
+                self.validation_pass_rate.labels(dataset_name="raw_data", symbol=symbol).set(pass_rate)
+                self.validation_critical_failures.labels(dataset_name="raw_data", symbol=symbol).set(result['critical_failures'])
+                self.validation_warnings.labels(dataset_name="raw_data", symbol=symbol).set(result['warnings'])
+                
+                # Count runs
+                status = "success" if result['critical_failures'] == 0 else "failed"
+                self.validation_runs_total.labels(dataset_name="raw_data", status=status).inc()
+        
+        # Log feature validation metrics
+        if feature_validation_results:
+            for symbol, result in feature_validation_results.items():
+                pass_rate = result['passed_rules'] / result['total_rules'] if result['total_rules'] > 0 else 0
+                
+                # MLflow metrics
+                mlflow.log_metric(f"feature_validation_pass_rate_{symbol}", pass_rate)
+                mlflow.log_metric(f"feature_validation_critical_{symbol}", result['critical_failures'])
+                mlflow.log_metric(f"feature_validation_warnings_{symbol}", result['warnings'])
+                
+                # Prometheus metrics
+                self.validation_pass_rate.labels(dataset_name="features", symbol=symbol).set(pass_rate)
+                self.validation_critical_failures.labels(dataset_name="features", symbol=symbol).set(result['critical_failures'])
+                self.validation_warnings.labels(dataset_name="features", symbol=symbol).set(result['warnings'])
+                
+                # Count runs
+                status = "success" if result['critical_failures'] == 0 else "failed"
+                self.validation_runs_total.labels(dataset_name="features", status=status).inc()
+        
+        # Create validation dashboard visualizations
+        self._create_validation_dashboard(raw_validation_results, feature_validation_results, symbols, run_id)
+        
+        # Save validation summary
+        self._save_validation_summary(raw_validation_results, feature_validation_results, run_id)
+      
+    def log_comprehensive_metrics(self, quality_results, feature_results, validation_results, symbols):
+        """Log all monitoring metrics including validation"""
+        
+        # Start MLflow run
+        experiment_name = "comprehensive_ml_monitoring"
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+        except:
+            mlflow.create_experiment(experiment_name)
+        
+        mlflow.set_experiment(experiment_name)
+        run = mlflow.start_run(run_name=f"comprehensive_monitoring_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_id = run.info.run_id
+        
+        try:
+            # Log data quality metrics (your existing code)
+            if quality_results:
+                overall_completeness = quality_results['completeness']['avg_completeness']
+                mlflow.log_metric("overall_completeness_ratio", overall_completeness)
+            
+            # Log feature engineering metrics (your existing code)
+            if feature_results:
+                total_features = sum(len(pd.read_parquet(BytesIO(self.minio_client.get_object('crypto-features', path).read())).columns) 
+                                   for path in feature_results['storage_paths'].values())
+                mlflow.log_metric("total_features_generated", total_features)
+            
+            # Log validation metrics (NEW)
+            if validation_results:
+                raw_validation = validation_results.get('raw_validation', {})
+                feature_validation = validation_results.get('feature_validation', {})
+                
+                self.log_validation_metrics(
+                    raw_validation, feature_validation, symbols, run_id
+                )
+            
+            self.logger.info("Comprehensive monitoring metrics logged successfully")
+            
+        finally:
+            mlflow.end_run()
+        
+        # Push to Prometheus
+        try:
+            from prometheus_client import push_to_gateway
+            push_to_gateway(self.prometheus_gateway, job='comprehensive_ml_monitoring', registry=self.registry)
+            self.logger.info("Pushed comprehensive metrics to Prometheus")
+        except Exception as e:
+            self.logger.error(f"Failed to push to Prometheus: {e}")
