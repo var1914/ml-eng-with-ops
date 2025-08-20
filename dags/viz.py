@@ -1,6 +1,6 @@
 import mlflow
 import mlflow.sklearn
-from prometheus_client import CollectorRegistry, Gauge, Counter, Histogram, push_to_gateway
+from prometheus_client import CollectorRegistry, Gauge, Counter, Histogram, push_to_gateway, Summary, Enum
 import pandas as pd
 import numpy as np
 import json
@@ -78,6 +78,9 @@ class MLMonitoringIntegration:
         
     def _setup_prometheus_metrics(self):
         """Initialize Prometheus metrics"""
+
+        # ============== DATA PIPELINE METRICS ==============
+
         # Data Quality Metrics
         self.dq_completeness_ratio = Gauge(
             'data_quality_completeness_ratio', 
@@ -980,3 +983,926 @@ class ValidationMonitoring(MLMonitoringIntegration):
             self.logger.info("Pushed comprehensive metrics to Prometheus")
         except Exception as e:
             self.logger.error(f"Failed to push to Prometheus: {e}")
+
+# Add these classes to your viz.py file to extend MLMonitoringIntegration
+
+class ModelTrainingMonitoring(MLMonitoringIntegration):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Add model-specific metrics to existing registry
+        self._setup_model_metrics()
+    
+    def _setup_model_metrics(self):
+        """Add model training specific metrics"""
+        # Model Training Metrics
+        self.model_training_time = Histogram(
+            'crypto_model_training_seconds',
+            'Model training time in seconds',
+            ['symbol', 'model_type'], registry=self.registry
+        )
+        
+        self.model_accuracy_score = Gauge(
+            'crypto_model_accuracy_score',
+            'Model accuracy metrics',
+            ['symbol', 'model_type', 'metric_type'], registry=self.registry
+        )
+        
+        self.model_cv_score = Gauge(
+            'crypto_model_cv_score',
+            'Cross-validation scores',
+            ['symbol', 'model_type', 'fold', 'metric'], registry=self.registry
+        )
+        
+        # Model Registry Metrics
+        self.models_registry_count = Gauge(
+            'crypto_models_registry_count',
+            'Number of models in registry by stage',
+            ['symbol', 'model_type', 'stage'], registry=self.registry
+        )
+        
+        self.model_promotions_total = Counter(
+            'crypto_model_promotions_total',
+            'Total model promotions',
+            ['symbol', 'model_type', 'from_stage', 'to_stage'], registry=self.registry
+        )
+        
+        self.model_age_days = Gauge(
+            'crypto_model_age_days',
+            'Age of current production model in days',
+            ['symbol', 'model_type'], registry=self.registry
+        )
+    
+    def log_model_training_metrics(self, training_results, symbols):
+        """Log model training results to MLflow and Prometheus"""
+        
+        # Clean up any existing MLflow state
+        try:
+            mlflow.end_run()
+        except:
+            pass
+        
+        # Check if experiment exists, create if not
+        experiment_name = "model_training"
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+                self.logger.info(f"Created new MLflow experiment: {experiment_name}")
+            else:
+                self.logger.info(f"Using existing MLflow experiment: {experiment_name}")
+        except Exception as e:
+            self.logger.warning(f"Error checking MLflow experiment: {e}, creating new one")
+            mlflow.create_experiment(experiment_name)
+
+        mlflow.set_experiment(experiment_name)
+        
+        # Start fresh run
+        run = mlflow.start_run(run_name=f"model_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_id = run.info.run_id
+        
+        try:
+            self.logger.info(f"Started MLflow run: {run_id}")
+            
+            # Log per-symbol model metrics
+            for symbol in symbols:
+                if symbol in training_results.get('model_results', {}):
+                    symbol_results = training_results['model_results'][symbol]
+                    
+                    for model_type, model_info in symbol_results.get('models', {}).items():
+                        metrics = model_info.get('metrics', {})
+                        
+                        # Log to MLflow
+                        for metric_name, metric_value in metrics.items():
+                            mlflow.log_metric(f"{model_type}_{metric_name}_{symbol}", metric_value)
+                        
+                        # Log to Prometheus
+                        for metric_name, metric_value in metrics.items():
+                            if not metric_name.endswith('_std'):  # Skip std deviation metrics
+                                self.model_accuracy_score.labels(
+                                    symbol=symbol, 
+                                    model_type=model_type, 
+                                    metric_type=metric_name
+                                ).set(metric_value)
+                        
+                        # Model registry count (newly trained models)
+                        self.models_registry_count.labels(
+                            symbol=symbol, 
+                            model_type=model_type, 
+                            stage='training'
+                        ).set(1)
+                        
+                        # Log cross-validation scores if available
+                        for fold in range(5):  # Assuming 5-fold CV
+                            for metric_name, metric_value in metrics.items():
+                                if f'{metric_name}_fold_{fold}' in metrics:
+                                    self.model_cv_score.labels(
+                                        symbol=symbol,
+                                        model_type=model_type,
+                                        fold=str(fold),
+                                        metric=metric_name
+                                    ).set(metrics[f'{metric_name}_fold_{fold}'])
+            
+            # Create model training visualizations
+            self._create_model_training_visualizations(training_results, symbols, run_id)
+            
+            # Save training results to MinIO
+            self._save_training_results_to_minio(training_results, run_id)
+            
+            # Update pipeline counter
+            self.pipeline_runs_total.labels(pipeline_type="model_training", status="success").inc()
+            
+        except Exception as mlflow_error:
+            self.logger.error(f"MLflow logging failed: {mlflow_error}")
+            raise
+        finally:
+            # Explicitly end the run
+            try:
+                mlflow.end_run()
+                self.logger.info("Ended MLflow run")
+            except Exception as e:
+                self.logger.warning(f"Error ending MLflow run: {e}")
+        
+        # Push to Prometheus
+        try:
+            push_to_gateway(self.prometheus_gateway, job='ml_model_training', 
+                          registry=self.registry)
+            self.logger.info("Pushed model training metrics to Prometheus")
+        except Exception as e:
+            self.logger.error(f"Failed to push to Prometheus: {e}")
+    
+    def _create_model_training_visualizations(self, training_results, symbols, run_id):
+        """Create model training visualizations"""
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Model accuracy comparison
+        model_data = []
+        for symbol in symbols:
+            if symbol in training_results.get('model_results', {}):
+                symbol_results = training_results['model_results'][symbol]
+                
+                for model_type, model_info in symbol_results.get('models', {}).items():
+                    metrics = model_info.get('metrics', {})
+                    rmse = metrics.get('rmse', 0)
+                    r2 = metrics.get('r2', 0)
+                    
+                    model_data.append({
+                        'symbol': symbol,
+                        'model_type': model_type,
+                        'rmse': rmse,
+                        'r2': r2
+                    })
+        
+        if model_data:
+            model_df = pd.DataFrame(model_data)
+            
+            # RMSE comparison
+            pivot_rmse = model_df.pivot(index='symbol', columns='model_type', values='rmse')
+            pivot_rmse.plot(kind='bar', ax=axes[0,0])
+            axes[0,0].set_title('RMSE by Model Type and Symbol')
+            axes[0,0].set_ylabel('RMSE')
+            axes[0,0].tick_params(axis='x', rotation=45)
+            
+            # R2 comparison
+            pivot_r2 = model_df.pivot(index='symbol', columns='model_type', values='r2')
+            pivot_r2.plot(kind='bar', ax=axes[0,1])
+            axes[0,1].set_title('R² by Model Type and Symbol')
+            axes[0,1].set_ylabel('R²')
+            axes[0,1].tick_params(axis='x', rotation=45)
+        
+        # 2. Model count by symbol
+        model_counts = []
+        for symbol in symbols:
+            if symbol in training_results.get('model_results', {}):
+                count = len(training_results['model_results'][symbol].get('models', {}))
+                model_counts.append(count)
+            else:
+                model_counts.append(0)
+        
+        axes[1,0].bar(symbols, model_counts)
+        axes[1,0].set_title('Models Trained by Symbol')
+        axes[1,0].set_ylabel('Number of Models')
+        axes[1,0].tick_params(axis='x', rotation=45)
+        
+        # 3. Training success rate
+        success_counts = []
+        total_counts = []
+        
+        for symbol in symbols:
+            if symbol in training_results.get('model_results', {}):
+                symbol_results = training_results['model_results'][symbol]
+                models = symbol_results.get('models', {})
+                
+                total = len(models)
+                success = len([m for m in models.values() if m.get('metrics', {}).get('rmse', float('inf')) < float('inf')])
+                
+                success_counts.append(success)
+                total_counts.append(total)
+            else:
+                success_counts.append(0)
+                total_counts.append(0)
+        
+        success_rates = [s/t*100 if t > 0 else 0 for s, t in zip(success_counts, total_counts)]
+        colors = ['green' if s == 100 else 'orange' if s > 50 else 'red' for s in success_rates]
+        
+        axes[1,1].bar(symbols, success_rates, color=colors)
+        axes[1,1].set_title('Training Success Rate by Symbol')
+        axes[1,1].set_ylabel('Success Rate (%)')
+        axes[1,1].set_ylim(0, 100)
+        axes[1,1].tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        
+        # Save to MinIO
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/model_training_overview.png"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
+        plt.close()
+        self.logger.info(f"Saved model training visualization to MinIO: {object_name}")
+    
+    def _save_training_results_to_minio(self, training_results, run_id):
+        """Save training results JSON to MinIO"""
+        
+        # Convert to JSON bytes
+        json_data = json.dumps(training_results, indent=2, default=str)
+        json_buffer = BytesIO(json_data.encode('utf-8'))
+        
+        # Save to MinIO
+        object_name = f"mlflow-runs/{run_id}/artifacts/model_training_results.json"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=json_buffer,
+            length=len(json_data.encode('utf-8')),
+            content_type='application/json'
+        )
+
+
+class ModelLifecycleMonitoring(MLMonitoringIntegration):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Add lifecycle-specific metrics to existing registry
+        self._setup_lifecycle_metrics()
+    
+    def _setup_lifecycle_metrics(self):
+        """Add model lifecycle specific metrics"""
+        self.model_health_score = Gauge(
+            'crypto_model_health_score',
+            'Overall model health score (0-100)',
+            ['symbol', 'model_type'], registry=self.registry
+        )
+        
+        self.model_performance_degradation = Gauge(
+            'crypto_model_performance_degradation',
+            'Performance degradation indicator (0=good, 1=degraded)',
+            ['symbol', 'model_type'], registry=self.registry
+        )
+        
+        self.model_deployment_status = Gauge(
+            'crypto_model_deployment_status',
+            'Model deployment status by stage',
+            ['symbol', 'model_type', 'stage'], registry=self.registry
+        )
+    
+    def log_lifecycle_metrics(self, lifecycle_results, symbols):
+        """Log model lifecycle results to MLflow and Prometheus"""
+        
+        # Clean up any existing MLflow state
+        try:
+            mlflow.end_run()
+        except:
+            pass
+        
+        # Check if experiment exists, create if not
+        experiment_name = "model_lifecycle"
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+                self.logger.info(f"Created new MLflow experiment: {experiment_name}")
+            else:
+                self.logger.info(f"Using existing MLflow experiment: {experiment_name}")
+        except Exception as e:
+            self.logger.warning(f"Error checking MLflow experiment: {e}, creating new one")
+            mlflow.create_experiment(experiment_name)
+
+        mlflow.set_experiment(experiment_name)
+        
+        # Start fresh run
+        run = mlflow.start_run(run_name=f"lifecycle_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_id = run.info.run_id
+        
+        try:
+            self.logger.info(f"Started MLflow run: {run_id}")
+            
+            # Log promotion metrics
+            promoted_staging = len(lifecycle_results.get('promoted_to_staging', []))
+            promoted_prod = len(lifecycle_results.get('promoted_to_production', []))
+            degraded_models = len(lifecycle_results.get('degraded_models', []))
+            
+            mlflow.log_metric("models_promoted_to_staging", promoted_staging)
+            mlflow.log_metric("models_promoted_to_production", promoted_prod)
+            mlflow.log_metric("degraded_models_count", degraded_models)
+            
+            # Log per-symbol lifecycle metrics
+            for symbol in symbols:
+                # Model health score (calculate based on available data)
+                health_score = self._calculate_model_health_score(symbol, lifecycle_results)
+                self.model_health_score.labels(
+                    symbol=symbol, 
+                    model_type='all'
+                ).set(health_score)
+                
+                mlflow.log_metric(f"health_score_{symbol}", health_score)
+            
+            # Log promotion events to Prometheus
+            for promotion in lifecycle_results.get('promoted_to_staging', []):
+                # Note: Counters increment, so we just call inc()
+                pass  # Counter already incremented in the promotion process
+            
+            for promotion in lifecycle_results.get('promoted_to_production', []):
+                # Note: Counters increment, so we just call inc()
+                pass  # Counter already incremented in the promotion process
+            
+            # Log degradation indicators
+            for degraded in lifecycle_results.get('degraded_models', []):
+                self.model_performance_degradation.labels(
+                    symbol=degraded['symbol'],
+                    model_type=degraded.get('model_type', 'unknown')
+                ).set(1)
+            
+            # Create lifecycle visualizations
+            self._create_lifecycle_visualizations(lifecycle_results, symbols, run_id)
+            
+            # Save lifecycle results to MinIO
+            self._save_lifecycle_results_to_minio(lifecycle_results, run_id)
+            
+            # Update pipeline counter
+            self.pipeline_runs_total.labels(pipeline_type="model_lifecycle", status="success").inc()
+            
+        except Exception as mlflow_error:
+            self.logger.error(f"MLflow logging failed: {mlflow_error}")
+            raise
+        finally:
+            # Explicitly end the run
+            try:
+                mlflow.end_run()
+                self.logger.info("Ended MLflow run")
+            except Exception as e:
+                self.logger.warning(f"Error ending MLflow run: {e}")
+        
+        # Push to Prometheus
+        try:
+            push_to_gateway(self.prometheus_gateway, job='ml_model_lifecycle', 
+                          registry=self.registry)
+            self.logger.info("Pushed model lifecycle metrics to Prometheus")
+        except Exception as e:
+            self.logger.error(f"Failed to push to Prometheus: {e}")
+    
+    def _calculate_model_health_score(self, symbol, lifecycle_results):
+        """Calculate model health score based on lifecycle data"""
+        base_score = 100
+        
+        # Reduce score for degraded models
+        degraded_models = lifecycle_results.get('degraded_models', [])
+        symbol_degraded = [m for m in degraded_models if m['symbol'] == symbol]
+        if symbol_degraded:
+            base_score -= 30
+        
+        # Improve score for recent promotions
+        recent_promotions = lifecycle_results.get('promoted_to_production', [])
+        symbol_promotions = [p for p in recent_promotions if p['symbol'] == symbol]
+        if symbol_promotions:
+            base_score += 10
+        
+        return max(0, min(100, base_score))
+    
+    def _create_lifecycle_visualizations(self, lifecycle_results, symbols, run_id):
+        """Create model lifecycle visualizations"""
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Promotion summary
+        staging_promotions = len(lifecycle_results.get('promoted_to_staging', []))
+        prod_promotions = len(lifecycle_results.get('promoted_to_production', []))
+        
+        stages = ['Staging', 'Production']
+        counts = [staging_promotions, prod_promotions]
+        colors = ['orange', 'green']
+        
+        axes[0,0].bar(stages, counts, color=colors)
+        axes[0,0].set_title('Model Promotions')
+        axes[0,0].set_ylabel('Number of Promotions')
+        
+        # 2. Health scores by symbol
+        health_scores = []
+        for symbol in symbols:
+            score = self._calculate_model_health_score(symbol, lifecycle_results)
+            health_scores.append(score)
+        
+        colors = ['green' if s > 80 else 'orange' if s > 60 else 'red' for s in health_scores]
+        axes[0,1].bar(symbols, health_scores, color=colors)
+        axes[0,1].set_title('Model Health Score by Symbol')
+        axes[0,1].set_ylabel('Health Score')
+        axes[0,1].set_ylim(0, 100)
+        axes[0,1].tick_params(axis='x', rotation=45)
+        
+        # 3. Degraded models
+        degraded_symbols = [m['symbol'] for m in lifecycle_results.get('degraded_models', [])]
+        degraded_counts = [degraded_symbols.count(symbol) for symbol in symbols]
+        
+        axes[1,0].bar(symbols, degraded_counts, color='red', alpha=0.7)
+        axes[1,0].set_title('Degraded Models by Symbol')
+        axes[1,0].set_ylabel('Count')
+        axes[1,0].tick_params(axis='x', rotation=45)
+        
+        # 4. Model lineage summary
+        lineage_data = lifecycle_results.get('model_lineage', {})
+        if lineage_data:
+            lineage_counts = [len(lineage_data.get(symbol, [])) for symbol in symbols]
+            axes[1,1].bar(symbols, lineage_counts)
+            axes[1,1].set_title('Model History by Symbol')
+            axes[1,1].set_ylabel('Number of Versions')
+            axes[1,1].tick_params(axis='x', rotation=45)
+        else:
+            axes[1,1].text(0.5, 0.5, 'No Lineage Data', ha='center', va='center', 
+                          transform=axes[1,1].transAxes)
+            axes[1,1].set_title('Model Lineage (No Data)')
+        
+        plt.tight_layout()
+        
+        # Save to MinIO
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/model_lifecycle_overview.png"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
+        plt.close()
+        self.logger.info(f"Saved model lifecycle visualization to MinIO: {object_name}")
+    
+    def _save_lifecycle_results_to_minio(self, lifecycle_results, run_id):
+        """Save lifecycle results JSON to MinIO"""
+        
+        # Convert to JSON bytes
+        json_data = json.dumps(lifecycle_results, indent=2, default=str)
+        json_buffer = BytesIO(json_data.encode('utf-8'))
+        
+        # Save to MinIO
+        object_name = f"mlflow-runs/{run_id}/artifacts/model_lifecycle_results.json"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=json_buffer,
+            length=len(json_data.encode('utf-8')),
+            content_type='application/json'
+        )
+
+
+class ComprehensiveMonitoring(MLMonitoringIntegration):
+    def __init__(self, db_config, **kwargs):
+        super().__init__(**kwargs)
+        self.db_config = db_config
+        # Add comprehensive metrics to existing registry
+        self._setup_comprehensive_metrics()
+    
+    def _setup_comprehensive_metrics(self):
+        """Add comprehensive monitoring metrics"""
+        # Overall pipeline health
+        self.crypto_pipeline_health_score = Gauge(
+            'crypto_pipeline_health_score',
+            'Overall pipeline health score',
+            ['symbol'], registry=self.registry
+        )
+        
+        # Business metrics
+        self.crypto_data_quality_score = Gauge(
+            'crypto_data_quality_score',
+            'Overall data quality score (0-100)',
+            ['symbol'], registry=self.registry
+        )
+        
+        self.crypto_feature_count = Gauge(
+            'crypto_feature_count_total',
+            'Total number of features generated',
+            ['symbol', 'feature_category'], registry=self.registry
+        )
+    
+    def log_comprehensive_metrics(self, quality_results, feature_results, training_results, 
+                                lifecycle_results, validation_results, symbols):
+        """Log all monitoring metrics in comprehensive view"""
+        
+        # Start MLflow run
+        experiment_name = "comprehensive_ml_monitoring"
+        try:
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+        except:
+            mlflow.create_experiment(experiment_name)
+        
+        mlflow.set_experiment(experiment_name)
+        run = mlflow.start_run(run_name=f"comprehensive_monitoring_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_id = run.info.run_id
+        
+        try:
+            # Log data quality metrics
+            if quality_results:
+                overall_completeness = quality_results['completeness']['avg_completeness']
+                mlflow.log_metric("overall_completeness_ratio", overall_completeness)
+                
+                # Log per-symbol quality scores to Prometheus
+                for symbol in symbols:
+                    completeness = next(
+                        (s['completeness_ratio'] for s in quality_results['completeness']['completeness_summary'] 
+                         if s['symbol'] == symbol), 0
+                    )
+                    gaps = quality_results['timestamp_continuity'][symbol]['gaps_found']
+                    outliers = quality_results['outlier_detection'][symbol]['total_outliers']
+                    
+                    # Calculate quality score
+                    quality_score = max(0, completeness * 100 - gaps * 2 - outliers * 0.1)
+                    self.crypto_data_quality_score.labels(symbol=symbol).set(quality_score)
+            
+            # Log feature engineering metrics
+            if feature_results:
+                for symbol in symbols:
+                    if symbol in feature_results.get('storage_paths', {}):
+                        try:
+                            # Load and analyze features
+                            response = self.minio_client.get_object('crypto-features', 
+                                                                  feature_results['storage_paths'][symbol])
+                            df = pd.read_parquet(BytesIO(response.read()))
+                            response.close()
+                            response.release_conn()
+                            
+                            # Categorize and count features
+                            feature_categories = self._categorize_features(df.columns)
+                            for category, count in feature_categories.items():
+                                self.crypto_feature_count.labels(
+                                    symbol=symbol, feature_category=category
+                                ).set(count)
+                            
+                            mlflow.log_metric(f"total_features_{symbol}", len(df.columns))
+                            
+                        except Exception as e:
+                            self.logger.error(f"Failed to process features for {symbol}: {e}")
+            
+            # Log training and lifecycle metrics through specialized classes
+            if training_results:
+                training_monitor = ModelTrainingMonitoring(**{
+                    'mlflow_tracking_uri': self.mlflow_tracking_uri,
+                    'prometheus_gateway': self.prometheus_gateway
+                })
+                # Just update metrics, don't create separate MLflow run
+                training_monitor.registry = self.registry  # Share registry
+                for symbol in symbols:
+                    if symbol in training_results.get('model_results', {}):
+                        symbol_results = training_results['model_results'][symbol]
+                        for model_type, model_info in symbol_results.get('models', {}).items():
+                            metrics = model_info.get('metrics', {})
+                            for metric_name, metric_value in metrics.items():
+                                if not metric_name.endswith('_std'):
+                                    training_monitor.model_accuracy_score.labels(
+                                        symbol=symbol, model_type=model_type, metric_type=metric_name
+                                    ).set(metric_value)
+            
+            if lifecycle_results:
+                lifecycle_monitor = ModelLifecycleMonitoring(**{
+                    'mlflow_tracking_uri': self.mlflow_tracking_uri,
+                    'prometheus_gateway': self.prometheus_gateway
+                })
+                # Just update metrics, don't create separate MLflow run
+                lifecycle_monitor.registry = self.registry  # Share registry
+                for symbol in symbols:
+                    health_score = lifecycle_monitor._calculate_model_health_score(symbol, lifecycle_results)
+                    lifecycle_monitor.model_health_score.labels(
+                        symbol=symbol, model_type='all'
+                    ).set(health_score)
+            
+            # Calculate and log overall pipeline health
+            for symbol in symbols:
+                pipeline_health = self._calculate_pipeline_health(
+                    symbol, quality_results, feature_results, training_results, 
+                    lifecycle_results, validation_results
+                )
+                self.crypto_pipeline_health_score.labels(symbol=symbol).set(pipeline_health)
+                mlflow.log_metric(f"pipeline_health_{symbol}", pipeline_health)
+            
+            # Create comprehensive dashboard
+            self._create_comprehensive_dashboard(
+                quality_results, feature_results, training_results, 
+                lifecycle_results, validation_results, symbols, run_id
+            )
+            
+            self.logger.info("Comprehensive monitoring metrics logged successfully")
+            
+        finally:
+            mlflow.end_run()
+        
+        # Push to Prometheus
+        try:
+            push_to_gateway(self.prometheus_gateway, job='comprehensive_ml_monitoring', 
+                          registry=self.registry)
+            self.logger.info("Pushed comprehensive metrics to Prometheus")
+        except Exception as e:
+            self.logger.error(f"Failed to push to Prometheus: {e}")
+    
+    def _calculate_pipeline_health(self, symbol, quality_results, feature_results, 
+                                 training_results, lifecycle_results, validation_results):
+        """Calculate overall pipeline health score for a symbol"""
+        scores = []
+        
+        # Data quality score (weight: 30%)
+        if quality_results:
+            completeness = next(
+                (s['completeness_ratio'] for s in quality_results['completeness']['completeness_summary'] 
+                 if s['symbol'] == symbol), 0
+            )
+            gaps = quality_results['timestamp_continuity'][symbol]['gaps_found']
+            outliers = quality_results['outlier_detection'][symbol]['total_outliers']
+            quality_score = max(0, completeness * 100 - gaps * 2 - outliers * 0.1)
+            scores.append((quality_score, 0.3))
+        
+        # Feature engineering score (weight: 20%)
+        if feature_results and symbol in feature_results.get('storage_paths', {}):
+            scores.append((100, 0.2))  # Assume success if features exist
+        
+        # Training score (weight: 30%)
+        if training_results and symbol in training_results.get('model_results', {}):
+            symbol_results = training_results['model_results'][symbol]
+            if symbol_results.get('models'):
+                scores.append((100, 0.3))  # Assume success if models trained
+        
+        # Lifecycle score (weight: 20%)
+        if lifecycle_results:
+            degraded_models = lifecycle_results.get('degraded_models', [])
+            symbol_degraded = [m for m in degraded_models if m['symbol'] == symbol]
+            lifecycle_score = 100 if not symbol_degraded else 70
+            scores.append((lifecycle_score, 0.2))
+        
+        # Calculate weighted average
+        if scores:
+            total_score = sum(score * weight for score, weight in scores)
+            total_weight = sum(weight for _, weight in scores)
+            return total_score / total_weight if total_weight > 0 else 0
+        else:
+            return 50  # Default score when no data available
+    
+    def _categorize_features(self, columns):
+        """Helper to categorize features"""
+        categories = {
+            'technical': 0, 'price': 0, 'volume': 0, 'time': 0, 'cross_symbol': 0, 'other': 0
+        }
+        
+        for col in columns:
+            col_lower = col.lower()
+            if any(x in col_lower for x in ['rsi', 'macd', 'sma', 'ema', 'bb_', 'atr']):
+                categories['technical'] += 1
+            elif any(x in col_lower for x in ['return', 'volatility', 'price', 'high', 'low', 'close', 'open']):
+                categories['price'] += 1
+            elif any(x in col_lower for x in ['volume', 'obv', 'vwap']):
+                categories['volume'] += 1
+            elif any(x in col_lower for x in ['hour', 'day', 'month', 'weekend', 'session']):
+                categories['time'] += 1
+            elif any(x in col_lower for x in ['corr_', 'relative_', 'ratio_to_', 'btc']):
+                categories['cross_symbol'] += 1
+            else:
+                categories['other'] += 1
+        
+        return categories
+    
+    def _create_comprehensive_dashboard(self, quality_results, feature_results, training_results, 
+                                      lifecycle_results, validation_results, symbols, run_id):
+        """Create comprehensive monitoring dashboard"""
+        
+        fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+        
+        # 1. Data Quality Scores
+        if quality_results:
+            quality_scores = []
+            for symbol in symbols:
+                completeness = next(
+                    (s['completeness_ratio'] for s in quality_results['completeness']['completeness_summary'] 
+                     if s['symbol'] == symbol), 0
+                )
+                gaps = quality_results['timestamp_continuity'][symbol]['gaps_found']
+                outliers = quality_results['outlier_detection'][symbol]['total_outliers']
+                quality_score = max(0, completeness * 100 - gaps * 2 - outliers * 0.1)
+                quality_scores.append(quality_score)
+            
+            colors = ['green' if s > 80 else 'orange' if s > 60 else 'red' for s in quality_scores]
+            axes[0,0].bar(symbols, quality_scores, color=colors)
+            axes[0,0].set_title('Data Quality Score by Symbol')
+            axes[0,0].set_ylabel('Quality Score')
+            axes[0,0].tick_params(axis='x', rotation=45)
+        
+        # 2. Feature Counts
+        if feature_results:
+            feature_counts = []
+            for symbol in symbols:
+                if symbol in feature_results.get('storage_paths', {}):
+                    try:
+                        response = self.minio_client.get_object('crypto-features', 
+                                                              feature_results['storage_paths'][symbol])
+                        df = pd.read_parquet(BytesIO(response.read()))
+                        response.close()
+                        response.release_conn()
+                        feature_counts.append(len(df.columns))
+                    except:
+                        feature_counts.append(0)
+                else:
+                    feature_counts.append(0)
+            
+            axes[0,1].bar(symbols, feature_counts)
+            axes[0,1].set_title('Feature Count by Symbol')
+            axes[0,1].set_ylabel('Number of Features')
+            axes[0,1].tick_params(axis='x', rotation=45)
+        
+        # 3. Model Training Results
+        if training_results:
+            model_counts = []
+            best_rmse_scores = []
+            
+            for symbol in symbols:
+                if symbol in training_results.get('model_results', {}):
+                    symbol_results = training_results['model_results'][symbol]
+                    models = symbol_results.get('models', {})
+                    model_counts.append(len(models))
+                    
+                    # Get best RMSE
+                    best_rmse = float('inf')
+                    for model_info in models.values():
+                        rmse = model_info.get('metrics', {}).get('rmse', float('inf'))
+                        if rmse < best_rmse:
+                            best_rmse = rmse
+                    
+                    best_rmse_scores.append(best_rmse if best_rmse != float('inf') else 0)
+                else:
+                    model_counts.append(0)
+                    best_rmse_scores.append(0)
+            
+            axes[0,2].bar(symbols, model_counts)
+            axes[0,2].set_title('Models Trained by Symbol')
+            axes[0,2].set_ylabel('Number of Models')
+            axes[0,2].tick_params(axis='x', rotation=45)
+        
+        # 4. Model Health Scores
+        if lifecycle_results:
+            health_scores = []
+            for symbol in symbols:
+                health_score = self._calculate_model_health_score_local(symbol, lifecycle_results)
+                health_scores.append(health_score)
+            
+            colors = ['green' if s > 80 else 'orange' if s > 60 else 'red' for s in health_scores]
+            axes[1,0].bar(symbols, health_scores, color=colors)
+            axes[1,0].set_title('Model Health Score by Symbol')
+            axes[1,0].set_ylabel('Health Score')
+            axes[1,0].set_ylim(0, 100)
+            axes[1,0].tick_params(axis='x', rotation=45)
+        
+        # 5. Validation Pass Rates
+        if validation_results:
+            raw_pass_rates = []
+            feature_pass_rates = []
+            
+            raw_validation = validation_results.get('raw_validation', {})
+            feature_validation = validation_results.get('feature_validation', {})
+            
+            for symbol in symbols:
+                if raw_validation and symbol in raw_validation:
+                    result = raw_validation[symbol]
+                    pass_rate = result['passed_rules'] / result['total_rules'] if result['total_rules'] > 0 else 0
+                    raw_pass_rates.append(pass_rate * 100)
+                else:
+                    raw_pass_rates.append(0)
+                
+                if feature_validation and symbol in feature_validation:
+                    result = feature_validation[symbol]
+                    pass_rate = result['passed_rules'] / result['total_rules'] if result['total_rules'] > 0 else 0
+                    feature_pass_rates.append(pass_rate * 100)
+                else:
+                    feature_pass_rates.append(0)
+            
+            x = np.arange(len(symbols))
+            width = 0.35
+            
+            axes[1,1].bar(x - width/2, raw_pass_rates, width, label='Raw Data', alpha=0.8)
+            axes[1,1].bar(x + width/2, feature_pass_rates, width, label='Features', alpha=0.8)
+            axes[1,1].set_xlabel('Symbols')
+            axes[1,1].set_ylabel('Pass Rate (%)')
+            axes[1,1].set_title('Validation Pass Rates')
+            axes[1,1].set_xticks(x)
+            axes[1,1].set_xticklabels(symbols, rotation=45)
+            axes[1,1].legend()
+            axes[1,1].set_ylim(0, 100)
+        
+        # 6. Overall Pipeline Health
+        pipeline_health_scores = []
+        for symbol in symbols:
+            health_score = self._calculate_pipeline_health(
+                symbol, quality_results, feature_results, training_results, 
+                lifecycle_results, validation_results
+            )
+            pipeline_health_scores.append(health_score)
+        
+        colors = ['green' if s > 80 else 'orange' if s > 60 else 'red' for s in pipeline_health_scores]
+        axes[1,2].bar(symbols, pipeline_health_scores, color=colors)
+        axes[1,2].set_title('Overall Pipeline Health')
+        axes[1,2].set_ylabel('Health Score')
+        axes[1,2].set_ylim(0, 100)
+        axes[1,2].tick_params(axis='x', rotation=45)
+        
+        # 7. Model Promotions Summary
+        if lifecycle_results:
+            staging_count = len(lifecycle_results.get('promoted_to_staging', []))
+            prod_count = len(lifecycle_results.get('promoted_to_production', []))
+            degraded_count = len(lifecycle_results.get('degraded_models', []))
+            
+            categories = ['Staging', 'Production', 'Degraded']
+            counts = [staging_count, prod_count, degraded_count]
+            colors = ['orange', 'green', 'red']
+            
+            axes[2,0].bar(categories, counts, color=colors)
+            axes[2,0].set_title('Model Status Summary')
+            axes[2,0].set_ylabel('Count')
+        
+        # 8. Pipeline Summary Statistics
+        total_symbols = len(symbols)
+        healthy_symbols = len([s for s in pipeline_health_scores if s > 80])
+        warning_symbols = len([s for s in pipeline_health_scores if 60 <= s <= 80])
+        critical_symbols = len([s for s in pipeline_health_scores if s < 60])
+        
+        axes[2,1].text(0.1, 0.8, f'Total Symbols: {total_symbols}', transform=axes[2,1].transAxes, fontsize=12)
+        axes[2,1].text(0.1, 0.6, f'Healthy: {healthy_symbols}', transform=axes[2,1].transAxes, fontsize=12, color='green')
+        axes[2,1].text(0.1, 0.4, f'Warning: {warning_symbols}', transform=axes[2,1].transAxes, fontsize=12, color='orange')
+        axes[2,1].text(0.1, 0.2, f'Critical: {critical_symbols}', transform=axes[2,1].transAxes, fontsize=12, color='red')
+        axes[2,1].set_title('Pipeline Summary')
+        axes[2,1].axis('off')
+        
+        # 9. Overall Status
+        overall_health = np.mean(pipeline_health_scores)
+        status = "Healthy" if overall_health > 80 else "Warning" if overall_health > 60 else "Critical"
+        status_color = "green" if overall_health > 80 else "orange" if overall_health > 60 else "red"
+        
+        axes[2,2].text(0.5, 0.6, f'Overall Status:', transform=axes[2,2].transAxes, fontsize=14, ha='center')
+        axes[2,2].text(0.5, 0.4, f'{status}', transform=axes[2,2].transAxes, fontsize=16, ha='center', 
+                      color=status_color, weight='bold')
+        axes[2,2].text(0.5, 0.2, f'Health Score: {overall_health:.1f}%', transform=axes[2,2].transAxes, 
+                      fontsize=12, ha='center')
+        axes[2,2].set_title('Overall Pipeline Status')
+        axes[2,2].axis('off')
+        
+        plt.tight_layout()
+        
+        # Save to MinIO
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+        img_buffer.seek(0)
+        
+        object_name = f"mlflow-runs/{run_id}/artifacts/comprehensive_monitoring_dashboard.png"
+        self.minio_client.put_object(
+            bucket_name=self.artifact_bucket,
+            object_name=object_name,
+            data=img_buffer,
+            length=len(img_buffer.getvalue()),
+            content_type='image/png'
+        )
+        
+        plt.close()
+        self.logger.info(f"Saved comprehensive dashboard to MinIO: {object_name}")
+    
+    def _calculate_model_health_score_local(self, symbol, lifecycle_results):
+        """Calculate model health score (local version to avoid circular dependency)"""
+        base_score = 100
+        
+        # Reduce score for degraded models
+        degraded_models = lifecycle_results.get('degraded_models', [])
+        symbol_degraded = [m for m in degraded_models if m['symbol'] == symbol]
+        if symbol_degraded:
+            base_score -= 30
+        
+        # Improve score for recent promotions
+        recent_promotions = lifecycle_results.get('promoted_to_production', [])
+        symbol_promotions = [p for p in recent_promotions if p['symbol'] == symbol]
+        if symbol_promotions:
+            base_score += 10
+        
+        return max(0, min(100, base_score))
