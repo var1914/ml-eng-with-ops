@@ -8,7 +8,7 @@ import logging
 
 from data_quality import DataQualityAssessment
 from feature_eng import FeatureEngineeringPipeline
-from viz import DataQualityMonitoring, FeatureEngineeringMonitoring, ValidationMonitoring
+from viz import DataQualityMonitoring, FeatureEngineeringMonitoring, ValidationMonitoring, ModelTrainingMonitoring, ModelLifecycleMonitoring, ComprehensiveMonitoring
 from data_versioning import DVCDataVersioning, dvc_version_raw_data, dvc_version_features_data
 from automated_data_validation import validate_raw_data, validate_feature_data
 from model_training import ModelTrainingPipeline
@@ -173,81 +173,6 @@ def run_dvc_data_versioning(**context):
         logger.error(f"DVC data versioning failed: {str(e)}")
         raise
 
-def log_monitoring_metrics(**context):
-    """Log monitoring metrics using results from upstream tasks"""
-    try:
-        # Pull results from upstream tasks via XCom
-        quality_results = context['task_instance'].xcom_pull(
-            task_ids='data_quality_assessment', 
-            key='quality_results'
-        )
-        feature_results = context['task_instance'].xcom_pull(
-            task_ids='feature_engineering', 
-            key='feature_results'
-        )
-        versioning_summary = context['task_instance'].xcom_pull(
-            task_ids='dvc_data_versioning', 
-            key='dvc_versioning_summary'
-        )
-
-        # Pull validation results
-        raw_validation = context['task_instance'].xcom_pull(
-            task_ids='raw_data_validation', 
-            key='raw_data_validation'
-        )
-        feature_validation = context['task_instance'].xcom_pull(
-            task_ids='feature_data_validation', 
-            key='feature_data_validation'
-        )
-        
-        # Combine validation results
-        validation_results = {
-            'raw_validation': raw_validation,
-            'feature_validation': feature_validation
-        }
-        
-        if not quality_results or not feature_results:
-            raise ValueError("Missing required results from upstream tasks")
-        
-        # Initialize monitoring components
-        dq_monitor = DataQualityMonitoring()
-        fe_monitor = FeatureEngineeringMonitoring()
-        validation_monitor = ValidationMonitoring(db_config=DB_CONFIG)
-
-        # Log metrics
-        dq_monitor.log_data_quality_metrics(quality_results, SYMBOLS)
-        fe_monitor.log_feature_engineering_metrics(feature_results, SYMBOLS)
-        validation_monitor.log_comprehensive_metrics(
-            quality_results, feature_results, validation_results, SYMBOLS
-        )
-        
-        # Log summary
-        total_critical = 0
-        total_warnings = 0
-        
-        if raw_validation:
-            total_critical += sum(r['critical_failures'] for r in raw_validation.values())
-            total_warnings += sum(r['warnings'] for r in raw_validation.values())
-        
-        if feature_validation:
-            total_critical += sum(r['critical_failures'] for r in feature_validation.values())
-            total_warnings += sum(r['warnings'] for r in feature_validation.values())
-        
-        logger.info(f"Comprehensive monitoring completed:")
-        logger.info(f"  - Quality assessment: {len(quality_results) if quality_results else 0} symbols")
-        logger.info(f"  - Feature engineering: {len(feature_results['storage_paths']) if feature_results else 0} symbols")
-        logger.info(f"  - DVC versioning: {versioning_summary['raw_data_versioned'] if versioning_summary else 0} versions")
-        logger.info(f"  - Validation: {total_critical} critical failures, {total_warnings} warnings")
-        
-        if total_critical > 0:
-            logger.warning(f"⚠️ {total_critical} critical validation failures detected!")
-        
-        logger.info("Successfully logged comprehensive monitoring metrics")
-        
-    except Exception as e:
-        logger.error(f"Comprehensive monitoring failed: {str(e)}")
-        raise
-
 def run_model_training(**context):
     """Enhanced model training with MLflow registry integration"""    
     try:
@@ -275,6 +200,95 @@ def run_model_training(**context):
     except Exception as e:
         logger.error(f"Model training with MLflow failed: {str(e)}")
         raise
+
+
+def log_monitoring_metrics(**context):
+    """Log monitoring metrics using results from upstream tasks"""
+    try:
+        # Pull results from upstream tasks via XCom
+        quality_results = context['task_instance'].xcom_pull(
+            task_ids='data_quality_assessment', 
+            key='quality_results'
+        )
+        feature_results = context['task_instance'].xcom_pull(
+            task_ids='feature_engineering', 
+            key='feature_results'
+        )
+        versioning_summary = context['task_instance'].xcom_pull(
+            task_ids='dvc_data_versioning', 
+            key='dvc_versioning_summary'
+        )
+        training_results = context['task_instance'].xcom_pull(
+            task_ids='model_training', 
+            key='training_results'
+        )
+        # Pull validation results
+        raw_validation = context['task_instance'].xcom_pull(
+            task_ids='raw_data_validation', 
+            key='raw_data_validation'
+        )
+        feature_validation = context['task_instance'].xcom_pull(
+            task_ids='feature_data_validation', 
+            key='feature_data_validation'
+        )
+        
+        # Combine validation results
+        validation_results = {
+            'raw_validation': raw_validation,
+            'feature_validation': feature_validation
+        }
+        
+        if not quality_results or not feature_results:
+            raise ValueError("Missing required results from upstream tasks")
+        
+        # Initialize monitoring components
+        dq_monitor = DataQualityMonitoring()
+        fe_monitor = FeatureEngineeringMonitoring()
+        validation_monitor = ValidationMonitoring(db_config=DB_CONFIG)
+        training_monitor = ModelTrainingMonitoring()
+        lifecycle_monitor = ModelLifecycleMonitoring()
+        comprehensive_monitor = ComprehensiveMonitoring(db_config=DB_CONFIG)
+
+        # Log metrics
+        dq_monitor.log_data_quality_metrics(quality_results, SYMBOLS)
+        fe_monitor.log_feature_engineering_metrics(feature_results, SYMBOLS)
+        validation_monitor.log_comprehensive_metrics(
+            quality_results, feature_results, validation_results, SYMBOLS
+        )
+        training_monitor.log_model_training_metrics(training_results, SYMBOLS)
+        # lifecycle_monitor.log_lifecycle_metrics(lifecycle_results, SYMBOLS)
+        # comprehensive_monitor.log_comprehensive_metrics(
+        #     quality_results, feature_results, training_results, 
+        #     lifecycle_results, validation_results, SYMBOLS
+        # )
+
+        # Log summary
+        total_critical = 0
+        total_warnings = 0
+        
+        if raw_validation:
+            total_critical += sum(r['critical_failures'] for r in raw_validation.values())
+            total_warnings += sum(r['warnings'] for r in raw_validation.values())
+        
+        if feature_validation:
+            total_critical += sum(r['critical_failures'] for r in feature_validation.values())
+            total_warnings += sum(r['warnings'] for r in feature_validation.values())
+        
+        logger.info(f"Comprehensive monitoring completed:")
+        logger.info(f"  - Quality assessment: {len(quality_results) if quality_results else 0} symbols")
+        logger.info(f"  - Feature engineering: {len(feature_results['storage_paths']) if feature_results else 0} symbols")
+        logger.info(f"  - DVC versioning: {versioning_summary['raw_data_versioned'] if versioning_summary else 0} versions")
+        logger.info(f"  - Validation: {total_critical} critical failures, {total_warnings} warnings")
+        
+        if total_critical > 0:
+            logger.warning(f"⚠️ {total_critical} critical validation failures detected!")
+        
+        logger.info("Successfully logged comprehensive monitoring metrics")
+        
+    except Exception as e:
+        logger.error(f"Comprehensive monitoring failed: {str(e)}")
+        raise
+
 
 default_args = {
     'owner': 'varunrajput',
