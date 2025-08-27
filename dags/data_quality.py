@@ -24,7 +24,7 @@ class DataQualityAssessment():
     def get_db_connection(self):
         return psycopg2.connect(**self.db_config)
     
-    def validate_timestamp_continuity(self, symbol, interval_minutes=60):
+    def validate_timestamp_continuity(self, symbol, interval_minutes):
         """Check for gaps in timestamp continuity"""
         """Uses the LAG window function to get the previous row's open_time value when rows are ordered by open_time, aliasing it as "prev_time"""
         """Calculates the time difference between current and previous open_time, divides by 60000 (converts milliseconds to minutes), aliases as "gap_minutes"""
@@ -103,8 +103,8 @@ class DataQualityAssessment():
             df = pd.read_sql(query, conn)
         
         # Calculate time span for each symbol (now both columns are numeric)
-        df['time_span_hours'] = (df['latest_time'] - df['earliest_time']) / (1000 * 3600)
-        df['expected_records'] = df['time_span_hours']  # 1 record per hour
+        df['time_span_hours'] = (df['latest_time'] - df['earliest_time']) / (1000 * 900)
+        df['expected_records'] = df['time_span_hours']  # 1 record per 15 min
         df['completeness_ratio'] = df['record_count'] / df['expected_records']
         
         return {
@@ -114,7 +114,7 @@ class DataQualityAssessment():
             'symbols_with_nulls': len(df[(df['null_prices'] > 0) | (df['null_volumes'] > 0)])
         }
     
-    def run_quality_assessment(self, symbols):
+    def run_quality_assessment(self, symbols, interval_minutes):
         """Run all quality checks"""
         results = {
             'assessment_time': datetime.now().isoformat(),
@@ -128,7 +128,7 @@ class DataQualityAssessment():
             self.logger.info(f"Assessing {symbol}...")
             
             # Timestamp continuity
-            results['timestamp_continuity'][symbol] = self.validate_timestamp_continuity(symbol)
+            results['timestamp_continuity'][symbol] = self.validate_timestamp_continuity(symbol, interval_minutes)
             
             # Outlier detection
             results['outlier_detection'][symbol] = self.check_price_volume_outliers(symbol)
