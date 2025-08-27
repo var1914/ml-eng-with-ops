@@ -126,20 +126,38 @@ class MLMonitoringIntegration:
             ['pipeline_type', 'status'], registry=self.registry
         )
 
-        self.validation_pass_rate = Gauge(
-            'data_validation_pass_rate',
-            'Data validation pass rate by dataset',
+        self.raw_validation_pass_rate = Gauge(
+            'raw_data_validation_pass_rate',
+            'Raw data validation pass rate by dataset',
             ['dataset_name', 'symbol'], registry=self.registry
         )
         
-        self.validation_critical_failures = Gauge(
-            'data_validation_critical_failures',
+        self.feature_validation_pass_rate = Gauge(
+            'feature_validation_pass_rate',
+            'Feature validation pass rate by dataset',
+            ['dataset_name', 'symbol'], registry=self.registry
+        )
+
+        self.feature_validation_critical_failures = Gauge(
+            'feature_validation_critical_failures',
+            'Number of critical validation failures',
+            ['dataset_name', 'symbol'], registry=self.registry
+        )
+
+        self.raw_validation_critical_failures = Gauge(
+            'raw_data_validation_critical_failures',
             'Number of critical validation failures',
             ['dataset_name', 'symbol'], registry=self.registry
         )
         
-        self.validation_warnings = Gauge(
-            'data_validation_warnings',
+        self.raw_validation_warnings = Gauge(
+            'raw_data_validation_warnings',
+            'Number of validation warnings',
+            ['dataset_name', 'symbol'], registry=self.registry
+        )
+        
+        self.feature_validation_warnings = Gauge(
+            'feature_validation_warnings',
             'Number of validation warnings',
             ['dataset_name', 'symbol'], registry=self.registry
         )
@@ -901,9 +919,9 @@ class ValidationMonitoring(MLMonitoringIntegration):
                 mlflow.log_metric(f"raw_validation_warnings_{symbol}", result['warnings'])
                 
                 # Prometheus metrics
-                self.validation_pass_rate.labels(dataset_name="raw_data", symbol=symbol).set(pass_rate)
-                self.validation_critical_failures.labels(dataset_name="raw_data", symbol=symbol).set(result['critical_failures'])
-                self.validation_warnings.labels(dataset_name="raw_data", symbol=symbol).set(result['warnings'])
+                self.raw_validation_pass_rate.labels(dataset_name="raw_data", symbol=symbol).set(pass_rate)
+                self.raw_validation_critical_failures.labels(dataset_name="raw_data", symbol=symbol).set(result['critical_failures'])
+                self.raw_validation_warnings.labels(dataset_name="raw_data", symbol=symbol).set(result['warnings'])
                 
                 # Count runs
                 status = "success" if result['critical_failures'] == 0 else "failed"
@@ -920,10 +938,10 @@ class ValidationMonitoring(MLMonitoringIntegration):
                 mlflow.log_metric(f"feature_validation_warnings_{symbol}", result['warnings'])
                 
                 # Prometheus metrics
-                self.validation_pass_rate.labels(dataset_name="features", symbol=symbol).set(pass_rate)
-                self.validation_critical_failures.labels(dataset_name="features", symbol=symbol).set(result['critical_failures'])
-                self.validation_warnings.labels(dataset_name="features", symbol=symbol).set(result['warnings'])
-                
+                self.feature_validation_pass_rate.labels(dataset_name="features", symbol=symbol).set(pass_rate)
+                self.feature_validation_critical_failures.labels(dataset_name="features", symbol=symbol).set(result['critical_failures'])
+                self.feature_validation_warnings.labels(dataset_name="features", symbol=symbol).set(result['warnings'])
+
                 # Count runs
                 status = "success" if result['critical_failures'] == 0 else "failed"
                 self.validation_runs_total.labels(dataset_name="features", status=status).inc()
