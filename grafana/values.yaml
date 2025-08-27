@@ -10,21 +10,15 @@ grafana:
       enabled: true
       label: grafana_dashboard
       folder: /tmp/dashboards
+      defaultFolderName: "ML Monitoring"
       searchNamespace: ml-monitoring
-    
-  # Enable dashboard provisioning  
-  dashboardProviders:
-    dashboardproviders.yaml:
-      apiVersion: 1
-      providers:
-      - name: 'default'
-        orgId: 1
-        folder: 'ML Monitoring'
+      provider:
+        name: sidecarProvider
+        orgid: 1
+        folder: "ML Monitoring"
         type: file
-        disableDeletion: false
-        editable: true
-        options:
-          path: /tmp/dashboards
+        disableDelete: false
+        allowUiUpdates: true
 
 prometheus:
   prometheusSpec:
