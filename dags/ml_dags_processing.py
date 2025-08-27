@@ -106,8 +106,8 @@ def run_data_quality_assessment(**context):
     """Run data quality assessment and return results via XCom"""
     try:
         assessor = DataQualityAssessment(DB_CONFIG)
-        quality_results = assessor.run_quality_assessment(SYMBOLS)
-        
+        quality_results = assessor.run_quality_assessment(SYMBOLS, interval_minutes=15) # As we are grabbing crypto data every 15 minutes
+
         logger.info(f"Data quality assessment completed for {len(SYMBOLS)} symbols")
         
         # Push results to XCom for downstream tasks
