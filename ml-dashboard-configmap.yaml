@@ -6,11 +6,10 @@ metadata:
   labels:
     grafana_dashboard: "1"
   annotations:
-    grafana_folder: "Crypto ML"
+    grafana_folder: "ML Monitoring"
 data:
   crypto-ml-overview.json: |
     {
-      "dashboard": {
         "id": null,
         "title": "Crypto ML Pipeline Overview",
         "tags": ["crypto", "ml", "overview"],
@@ -141,11 +140,9 @@ data:
             }
           ]
         }
-      }
     }
   data-quality-dashboard.json: |
     {
-      "dashboard": {
         "id": null,
         "title": "Data Quality Monitoring",
         "tags": ["crypto", "data-quality"],
@@ -179,26 +176,44 @@ data:
           {
             "id": 2,
             "title": "Data Completeness Ratio",
-            "type": "timeseries",
+            "type": "stat",
             "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
             "targets": [
               {
-                "expr": "data_quality_completeness_ratio",
+                "expr": "data_quality_completeness_ratio * 100",
                 "legendFormat": "{{symbol}}",
                 "refId": "A"
               }
             ],
             "fieldConfig": {
               "defaults": {
-                "unit": "percentunit",
+                "unit": "percent",
+                "min": 0,
+                "max": 100,
                 "thresholds": {
                   "steps": [
                     {"color": "red", "value": 0},
-                    {"color": "yellow", "value": 0.8},
-                    {"color": "green", "value": 0.95}
+                    {"color": "yellow", "value": 80},
+                    {"color": "green", "value": 95}
                   ]
+                },
+                "custom": {
+                  "displayMode": "gradient-gauge",
+                  "orientation": "auto"
                 }
               }
+            },
+            "options": {
+              "reduceOptions": {
+                "values": false,
+                "calcs": ["lastNotNull"],
+                "fields": ""
+              },
+              "orientation": "auto",
+              "textMode": "auto",
+              "colorMode": "background",
+              "graphMode": "area",
+              "justifyMode": "auto"
             }
           },
           {
@@ -245,33 +260,88 @@ data:
           },
           {
             "id": 4,
-            "title": "Timestamp Gaps & Outliers",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+            "title": "Timestamp Gaps",
+            "type": "bargauge",
+            "gridPos": {"h": 6, "w": 12, "x": 12, "y": 8},
             "targets": [
               {
                 "expr": "data_quality_timestamp_gaps",
-                "legendFormat": "Gaps - {{symbol}}",
+                "legendFormat": "{{symbol}}",
                 "refId": "A"
-              },
-              {
-                "expr": "data_quality_outliers_total",
-                "legendFormat": "Outliers - {{symbol}}",
-                "refId": "B"
               }
             ],
             "fieldConfig": {
               "defaults": {
-                "unit": "short"
+                "unit": "short",
+                "min": 0,
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": 0},
+                    {"color": "yellow", "value": 1},
+                    {"color": "red", "value": 10}
+                  ]
+                },
+                "custom": {
+                  "displayMode": "basic",
+                  "orientation": "horizontal"
+                }
               }
+            },
+            "options": {
+              "reduceOptions": {
+                "values": false,
+                "calcs": ["lastNotNull"],
+                "fields": ""
+              },
+              "orientation": "horizontal",
+              "displayMode": "basic",
+              "showUnfilled": true
+            }
+          },
+          {
+            "id": 5,
+            "title": "Data Outliers",
+            "type": "bargauge", 
+            "gridPos": {"h": 6, "w": 12, "x": 12, "y": 14},
+            "targets": [
+              {
+                "expr": "data_quality_outliers_total",
+                "legendFormat": "{{symbol}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "min": 0,
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": 0},
+                    {"color": "yellow", "value": 5},
+                    {"color": "red", "value": 20}
+                  ]
+                },
+                "custom": {
+                  "displayMode": "basic",
+                  "orientation": "horizontal"
+                }
+              }
+            },
+            "options": {
+              "reduceOptions": {
+                "values": false,
+                "calcs": ["lastNotNull"],
+                "fields": ""
+              },
+              "orientation": "horizontal",
+              "displayMode": "basic", 
+              "showUnfilled": true
             }
           }
         ]
-      }
     }
   model-performance-dashboard.json: |
     {
-      "dashboard": {
         "id": null,
         "title": "Model Performance & Training",
         "tags": ["crypto", "models"],
@@ -360,11 +430,9 @@ data:
             }
           }
         ]
-      }
     }
   feature-engineering-dashboard.json: |
     {
-      "dashboard": {
         "id": null,
         "title": "Feature Engineering Monitoring",
         "tags": ["crypto", "features"],
@@ -445,11 +513,10 @@ data:
             ]
           }
         ]
-      }
     }
+
   system-health-dashboard.json: |
     {
-      "dashboard": {
         "id": null,
         "title": "System Health & Infrastructure",
         "tags": ["crypto", "system"],
@@ -552,11 +619,10 @@ data:
             ]
           }
         ]
-      }
     }
+
   validation-monitoring-dashboard.json: |
     {
-      "dashboard": {
         "id": null,
         "title": "Data Validation Monitoring",
         "tags": ["crypto", "validation"],
@@ -569,12 +635,12 @@ data:
         "panels": [
           {
             "id": 1,
-            "title": "Validation Pass Rate",
+            "title": "Raw Validation Pass Rate",
             "type": "bargauge",
             "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
             "targets": [
               {
-                "expr": "data_validation_pass_rate",
+                "expr": "raw_data_validation_pass_rate",
                 "legendFormat": "{{dataset_name}} - {{symbol}}",
                 "refId": "A"
               }
@@ -596,12 +662,39 @@ data:
           },
           {
             "id": 2,
-            "title": "Critical Validation Failures",
+            "title": "Feature Validation Pass Rate",
+            "type": "bargauge",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "targets": [
+              {
+                "expr": "feature_validation_pass_rate",
+                "legendFormat": "{{dataset_name}} - {{symbol}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "min": 0,
+                "max": 1,
+                "unit": "percentunit",
+                "thresholds": {
+                  "steps": [
+                    {"color": "red", "value": 0},
+                    {"color": "yellow", "value": 0.7},
+                    {"color": "green", "value": 0.9}
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "id": 3,
+            "title": "Raw Critical Validation Failures",
             "type": "stat",
             "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
             "targets": [
               {
-                "expr": "sum by (symbol) (data_validation_critical_failures)",
+                "expr": "sum by (symbol) (raw_data_validation_critical_failures)",
                 "legendFormat": "{{symbol}}",
                 "refId": "A"
               }
@@ -618,13 +711,36 @@ data:
             }
           },
           {
-            "id": 3,
-            "title": "Validation Warnings Over Time",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+            "id": 4,
+            "title": "Feature Critical Validation Failures",
+            "type": "stat",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
             "targets": [
               {
-                "expr": "data_validation_warnings",
+                "expr": "sum by (symbol) (feature_validation_critical_failures)",
+                "legendFormat": "{{symbol}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": 0},
+                    {"color": "red", "value": 1}
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "id": 5,
+            "title": "Raw Validation Warnings Over Time",
+            "type": "bargauge",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "targets": [
+              {
+                "expr": "raw_data_validation_warnings",
                 "legendFormat": "{{dataset_name}} - {{symbol}}",
                 "refId": "A"
               }
@@ -642,7 +758,31 @@ data:
             }
           },
           {
-            "id": 4,
+            "id": 5,
+            "title": "Feature Validation Warnings Over Time",
+            "type": "bargauge",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "targets": [
+              {
+                "expr": "feature_validation_warnings",
+                "legendFormat": "{{dataset_name}} - {{symbol}}",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": 0},
+                    {"color": "yellow", "value": 5},
+                    {"color": "red", "value": 10}
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "id": 6,
             "title": "Validation Runs (Success vs Failed)",
             "type": "timeseries",
             "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
@@ -655,5 +795,4 @@ data:
             ]
           }
         ]
-      }
     }
