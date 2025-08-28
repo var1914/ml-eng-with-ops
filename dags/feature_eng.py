@@ -110,25 +110,28 @@ class FeatureEngineeringPipeline:
         return features
     
     def calculate_price_features(self, df):
-        """Calculate returns, volatility, price ratios"""
+        """Calculate returns, volatility, price ratios - UPDATED for multi-step"""
         features = df.copy()
         close = df['close_price']
         high = df['high_price']
         low = df['low_price']
         open_price = df['open_price']
         
-        # Returns
-        features['return_1h'] = close.pct_change()
-        features['return_4h'] = close.pct_change(periods=4)
-        features['return_24h'] = close.pct_change(periods=24)
-        features['return_7d'] = close.pct_change(periods=168)  # 7 days * 24 hours
+        # CURRENT ISSUE: You're calculating returns but not targets properly
+        # Keep these as FEATURES (not targets)
+        features['return_15m'] = close.pct_change()  
+        features['return_1h'] = close.pct_change(periods=4)
+        features['return_4h'] = close.pct_change(periods=16)
+        features['return_24h'] = close.pct_change(periods=96)
+        features['return_7d'] = close.pct_change(periods=672)
         
         # Log returns
-        features['log_return_1h'] = np.log(close / close.shift(1))
+        features['log_return_15m'] = np.log(close / close.shift(1))
         
         # Volatility (rolling standard deviation of returns)
-        features['volatility_24h'] = features['return_1h'].rolling(window=24).std()
-        features['volatility_7d'] = features['return_1h'].rolling(window=168).std()
+        features['volatility_1h'] = features['return_15m'].rolling(window=4).std()
+        features['volatility_24h'] = features['return_15m'].rolling(window=96).std()
+        features['volatility_7d'] = features['return_15m'].rolling(window=672).std()
         
         # Price ratios
         features['high_low_ratio'] = high / low
@@ -146,9 +149,73 @@ class FeatureEngineeringPipeline:
         tr2 = abs(high - prev_close)
         tr3 = abs(low - prev_close)
         features['true_range'] = np.maximum(tr1, np.maximum(tr2, tr3))
-        features['atr_14'] = features['true_range'].rolling(window=14).mean()
+        features['atr_14'] = features['true_range'].rolling(window=56).mean()
         
         return features
+
+    def create_multi_horizon_targets(self, df, horizons=[1, 4, 16, 96]):
+        """
+        Create multiple prediction targets for different horizons
+        horizons in 15-min periods: 1=15min, 4=1hour, 16=4hour, 96=24hour
+        """
+        targets = df[['open_time', 'close_price']].copy()  # Keep basic info
+        close = df['close_price']
+        
+        for h in horizons:
+            # 1. Price return prediction (regression)
+            targets[f'target_return_{h}steps'] = close.pct_change(periods=h).shift(-h)
+            
+            # 2. Direction prediction (binary classification) 
+            targets[f'target_direction_{h}steps'] = (targets[f'target_return_{h}steps'] > 0).astype(int)
+            
+            # 3. Multi-class direction prediction
+            returns = targets[f'target_return_{h}steps']
+            # Define thresholds based on your data (adjust these)
+            targets[f'target_direction_multi_{h}steps'] = pd.cut(
+                returns,
+                bins=[-np.inf, -0.02, -0.005, 0.005, 0.02, np.inf],
+                labels=[0, 1, 2, 3, 4]  # strong_down, down, neutral, up, strong_up
+            )
+            
+            # 4. Volatility prediction (regression)
+            # Realized volatility over next h periods
+            future_vol = close.pct_change().rolling(h).std().shift(-h)
+            targets[f'target_volatility_{h}steps'] = future_vol
+            
+            # 5. Volatility regime prediction (classification)
+            # Only create regime if we have valid volatility data
+            valid_vol = future_vol.dropna()
+            if len(valid_vol) > 10:  # Need minimum data points for quantiles
+                vol_quantiles = valid_vol.quantile([0.33, 0.67])
+                
+                # Check if quantiles are valid (not NaN and different values)
+                if not vol_quantiles.isna().any() and vol_quantiles.iloc[0] != vol_quantiles.iloc[1]:
+                    targets[f'target_vol_regime_{h}steps'] = pd.cut(
+                        future_vol,
+                        bins=[-np.inf, vol_quantiles.iloc[0], vol_quantiles.iloc[1], np.inf],
+                        labels=[0, 1, 2]  # low, medium, high volatility
+                    )
+                else:
+                    # Fallback: use fixed thresholds if quantiles fail
+                    targets[f'target_vol_regime_{h}steps'] = pd.cut(
+                        future_vol,
+                        bins=[-np.inf, 0.01, 0.03, np.inf],  # Fixed volatility thresholds
+                        labels=[0, 1, 2]
+                    )
+            else:
+                # Not enough data - create empty series with correct dtype
+                targets[f'target_vol_regime_{h}steps'] = pd.Series(
+                    np.nan, index=targets.index, dtype='category'
+                )
+            
+            # 6. Price level prediction (regression) - alternative to returns
+            targets[f'target_price_{h}steps'] = close.shift(-h)
+            
+            # 7. High/Low prediction for next h periods (regression)
+            targets[f'target_high_{h}steps'] = df['high_price'].rolling(h).max().shift(-h)
+            targets[f'target_low_{h}steps'] = df['low_price'].rolling(h).min().shift(-h)
+        
+        return targets
     
     def calculate_volume_features(self, df):
         """Calculate volume ratios, volume moving averages"""
@@ -181,8 +248,8 @@ class FeatureEngineeringPipeline:
             obv.append(obv_val)
         
         features['obv'] = obv
-        features['obv_sma_14'] = pd.Series(obv).rolling(window=14).mean()
-        
+        features['obv_sma_14'] = pd.Series(obv).rolling(window=56).mean()
+
         return features
     
     def calculate_time_features(self, df):
@@ -240,9 +307,9 @@ class FeatureEngineeringPipeline:
                 ref_data = aligned_data[reference_symbol]
                 
                 # Price correlation (rolling)
-                features['corr_with_btc_24h'] = features['close_price'].rolling(window=24).corr(
+                features['corr_with_btc_24h'] = features['close_price'].rolling(window=96).corr(
                     ref_data['close_price'])
-                features['corr_with_btc_7d'] = features['close_price'].rolling(window=168).corr(
+                features['corr_with_btc_7d'] = features['close_price'].rolling(window=672).corr(
                     ref_data['close_price'])
                 
                 # Relative strength
@@ -251,7 +318,7 @@ class FeatureEngineeringPipeline:
                 
                 # Price ratio to BTC
                 features['price_ratio_to_btc'] = features['close_price'] / ref_data['close_price']
-                features['ratio_ma_7'] = features['price_ratio_to_btc'].rolling(window=7).mean()
+                features['ratio_ma_7'] = features['price_ratio_to_btc'].rolling(window=28).mean()
                 
                 # Volume correlation
                 features['volume_corr_btc_24h'] = features['volume'].rolling(window=24).corr(
@@ -276,12 +343,13 @@ class FeatureEngineeringPipeline:
         
         return df
     
-    def run_feature_pipeline(self, symbols):
-        """Run complete feature engineering pipeline"""
+    def run_feature_pipeline(self, symbols, create_targets=True):
+        """Run complete feature engineering pipeline with optional target creation"""
         results = {
             'pipeline_time': datetime.now().isoformat(),
             'symbols_processed': [],
-            'storage_paths': {}
+            'storage_paths': {},
+            'target_paths': {}  # NEW: separate storage for targets
         }
         
         # Step 1: Individual symbol features
@@ -294,40 +362,64 @@ class FeatureEngineeringPipeline:
         self.logger.info("Calculating cross-symbol features")
         cross_features = self.calculate_cross_symbol_features(symbols)
         
-        # Step 3: Combine individual and cross-symbol features
+        # Step 3: Create targets if requested
+        targets_data = {}
+        if create_targets:
+            self.logger.info("Creating multi-horizon targets")
+            for symbol in symbols:
+                base_data = individual_features[symbol]
+                targets_data[symbol] = self.create_multi_horizon_targets(base_data)
+        
+        # Step 4: Combine and save
         for symbol in symbols:
-            # Get common columns between individual and cross features
+            # Combine features
             individual_cols = set(individual_features[symbol].columns)
             cross_cols = set(cross_features[symbol].columns)
             
-            # Merge on index (datetime)
-            combined = individual_features[symbol].copy()
-            
-            # Add cross-symbol features that aren't already present
+            combined_features = individual_features[symbol].copy()
             new_cross_features = cross_cols - individual_cols
             for col in new_cross_features:
-                combined[col] = cross_features[symbol][col]
+                combined_features[col] = cross_features[symbol][col]
             
-            # Save to MinIO
+            # Save features
             date_partition = datetime.now().strftime('%Y%m%d')
-            object_name = f"features/{date_partition}/{symbol}.parquet"
-        
-            # Convert DataFrame to parquet bytes
+            features_path = f"features/{date_partition}/{symbol}.parquet"
+            
             parquet_buffer = BytesIO()
-            combined.to_parquet(parquet_buffer, index=True)
+            combined_features.to_parquet(parquet_buffer, index=True)
             parquet_buffer.seek(0)
             
-            # Upload to MinIO
             self.minio_client.put_object(
                 bucket_name=BUCKET_NAME,
-                object_name=object_name,
+                object_name=features_path,
                 data=parquet_buffer,
                 length=len(parquet_buffer.getvalue()),
                 content_type='application/octet-stream'
             )
             
-            results['storage_paths'][symbol] = object_name
-            self.logger.info(f"Saved features for {symbol} to MinIO: {object_name}")
+            results['storage_paths'][symbol] = features_path
+            
+            # Save targets separately if created
+            if create_targets:
+                targets_path = f"targets/{date_partition}/{symbol}.parquet"
+                
+                targets_buffer = BytesIO()
+                targets_data[symbol].to_parquet(targets_buffer, index=True)
+                targets_buffer.seek(0)
+                
+                self.minio_client.put_object(
+                    bucket_name=BUCKET_NAME,
+                    object_name=targets_path,
+                    data=targets_buffer,
+                    length=len(targets_buffer.getvalue()),
+                    content_type='application/octet-stream'
+                )
+                
+                results['target_paths'][symbol] = targets_path
+                
+            self.logger.info(f"Saved features for {symbol} to MinIO: {features_path}")
+            if create_targets:
+                self.logger.info(f"Saved targets for {symbol} to MinIO: {targets_path}")
         
         return results
 
