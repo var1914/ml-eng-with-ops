@@ -27,6 +27,9 @@ from mlflow.types.schema import Schema, ColSpec
 import tempfile
 import os
 
+from automated_data_validation import DataValidationSuite
+
+
 # MinIO Configuration
 MINIO_CONFIG = {
     'endpoint': 'minio:9000',
@@ -37,13 +40,60 @@ MINIO_CONFIG = {
 
 BUCKET_NAME = 'crypto-models'
 
+# ADD this configuration at the top of the file:
+PREDICTION_CONFIGS = {
+    'return_1step': {
+        'target_col': 'target_return_1steps',
+        'task_type': 'regression',
+        'horizon_steps': 1,
+        'description': '15-minute price return prediction'
+    },
+    'return_4step': {
+        'target_col': 'target_return_4steps', 
+        'task_type': 'regression',
+        'horizon_steps': 4,
+        'description': '1-hour price return prediction'
+    },
+    'return_16step': {
+        'target_col': 'target_return_16steps',
+        'task_type': 'regression', 
+        'horizon_steps': 16,
+        'description': '4-hour price return prediction'
+    },
+    'direction_4step': {
+        'target_col': 'target_direction_4steps',
+        'task_type': 'classification_binary',
+        'horizon_steps': 4,
+        'description': '1-hour direction prediction (up/down)'
+    },
+    'direction_multi_4step': {
+        'target_col': 'target_direction_multi_4steps',
+        'task_type': 'classification_multi',
+        'horizon_steps': 4,
+        'description': '1-hour multi-class direction prediction'
+    },
+    'volatility_4step': {
+        'target_col': 'target_volatility_4steps',
+        'task_type': 'regression',
+        'horizon_steps': 4,
+        'description': '1-hour volatility prediction'
+    },
+    'vol_regime_4step': {
+        'target_col': 'target_vol_regime_4steps',
+        'task_type': 'classification_multi',
+        'horizon_steps': 4,
+        'description': '1-hour volatility regime prediction'
+    }
+}
+
+
 class MLflowModelRegistry:
     def __init__(self, tracking_uri="http://mlflow-tracking"):
         self.tracking_uri = tracking_uri
         mlflow.set_tracking_uri(tracking_uri)
         self.client = MlflowClient()
         self.logger = logging.getLogger("mlflow_registry")
-    
+
     def create_experiment_if_not_exists(self, experiment_name):
         """Create MLflow experiment if it doesn't exist"""
         try:
@@ -62,9 +112,9 @@ class MLflowModelRegistry:
                                metrics, feature_cols, dvc_version_id, model_path):
         """Log model to MLflow with full registry features"""
         
-        experiment_name = f"crypto_models_{symbol}"
+        experiment_name = f"crypto_multi_models_{symbol}"
         experiment_id = self.create_experiment_if_not_exists(experiment_name)
-        
+        params = {}
         with mlflow.start_run(experiment_id=experiment_id, 
                              run_name=f"{model_type}_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}") as run:
             
@@ -306,6 +356,8 @@ class ModelTrainingPipeline:
         self.scalers = {}
         # Add MLflow registry
         self.mlflow_registry = MLflowModelRegistry()
+        # ADD validation suite
+        self.validator = DataValidationSuite(db_config)
 
     
     def _get_minio_client(self):
@@ -406,111 +458,199 @@ class ModelTrainingPipeline:
             self.logger.error(f"Failed to load features for version {version_id}: {e}")
             raise
 
-    def prepare_training_data(self, df, target_col='return_1h', feature_cols=None):
-        """Prepare features and target for training with debugging"""
+    def load_features_and_targets_from_dvc(self, feature_version_id, target_version_id=None):
+        """Load both features and targets using DVC metadata"""
+        try:
+            # Load features
+            features_df, feature_metadata = self.load_features_from_dvc_fallback(feature_version_id)
+            
+            # Load targets (use same version_id if not specified)
+            if target_version_id is None:
+                target_version_id = feature_version_id.replace('features_', 'targets_')
+            
+            # Try to load targets from MinIO
+            try:
+                # Extract symbol and date from version_id
+                parts = feature_version_id.split('_')
+                symbol = parts[1]
+                timestamp = parts[2]
+                date_partition = timestamp[:8]  # YYYYMMDD
+                
+                targets_path = f"targets/{date_partition}/{symbol}.parquet"
+                
+                response = self.minio_client.get_object('crypto-features', targets_path)
+                targets_df = pd.read_parquet(BytesIO(response.read()))
+                response.close()
+                response.release_conn()
+                
+                self.logger.info(f"Loaded targets from {targets_path}")
+                
+            except Exception as e:
+                self.logger.warning(f"Could not load separate targets, will create from features: {e}")
+                # Fallback: create targets from features using your new method
+                targets_df = self.create_multi_horizon_targets_from_features(features_df)
+            
+            return features_df, targets_df, feature_metadata
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load features and targets: {e}")
+            raise
+
+    def create_multi_horizon_targets_from_features(self, features_df):
+        """Create targets from features DataFrame if targets not available separately"""
+        targets = features_df[['open_time']].copy() if 'open_time' in features_df.columns else pd.DataFrame(index=features_df.index)
         
-        self.logger.info(f"Input DataFrame shape: {df.shape}")
-        self.logger.info(f"Input DataFrame columns: {list(df.columns)}")
-        self.logger.info(f"Input DataFrame head:\n{df.head()}")
+        # Assume close_price exists for target creation
+        if 'close_price' not in features_df.columns:
+            raise ValueError("close_price column needed for target creation")
+        
+        close = features_df['close_price']
+        
+        for h in [1, 4, 16, 96]:  # 15min, 1h, 4h, 24h
+            # Price return targets
+            targets[f'target_return_{h}steps'] = close.pct_change(periods=h).shift(-h)
+            
+            # Direction targets  
+            targets[f'target_direction_{h}steps'] = (targets[f'target_return_{h}steps'] > 0).astype(int)
+            
+            # Multi-class direction
+            returns = targets[f'target_return_{h}steps']
+            targets[f'target_direction_multi_{h}steps'] = pd.cut(
+                returns,
+                bins=[-np.inf, -0.02, -0.005, 0.005, 0.02, np.inf],
+                labels=[0, 1, 2, 3, 4]
+            )
+            
+            # Volatility targets
+            targets[f'target_volatility_{h}steps'] = close.pct_change().rolling(h).std().shift(-h)
+            
+            # Volatility regime targets
+            vol = targets[f'target_volatility_{h}steps']
+            vol_quantiles = vol.quantile([0.33, 0.67])
+            targets[f'target_vol_regime_{h}steps'] = pd.cut(
+                vol,
+                bins=[-np.inf, vol_quantiles.iloc[0], vol_quantiles.iloc[1], np.inf],
+                labels=[0, 1, 2]
+            )
+        
+        return targets
+
+    def prepare_training_data(self, features_df, targets_df, task_config):
+        """
+        Prepare features and target for training with proper multi-step alignment
+        
+        Args:
+            features_df: DataFrame with engineered features
+            targets_df: DataFrame with multi-horizon targets  
+            task_config: Configuration dict from PREDICTION_CONFIGS
+        """
+        target_col = task_config['target_col']
+        task_type = task_config['task_type']
+        horizon_steps = task_config['horizon_steps']
+        
+        self.logger.info(f"Preparing training data for {target_col}")
+        self.logger.info(f"Features shape: {features_df.shape}, Targets shape: {targets_df.shape}")
         
         # Check if target column exists
-        if target_col not in df.columns:
-            self.logger.error(f"Target column '{target_col}' not found in DataFrame")
-            self.logger.info(f"Available columns: {list(df.columns)}")
-            # Fallback to creating return_1h if close_price exists
-            if 'close_price' in df.columns:
-                self.logger.info("Creating return_1h from close_price")
-                df[target_col] = df['close_price'].pct_change()
-            else:
-                raise ValueError(f"Cannot create target column {target_col}")
+        if target_col not in targets_df.columns:
+            self.logger.error(f"Target column '{target_col}' not found in targets DataFrame")
+            self.logger.info(f"Available target columns: {list(targets_df.columns)}")
+            raise ValueError(f"Target column {target_col} not found")
         
-        # Remove non-numeric columns and handle missing values
-        if feature_cols is None:
-            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            self.logger.info(f"Numeric columns found: {len(numeric_cols)}")
-            
-            # Remove target column and time-related columns from features
-            exclude_cols = [target_col, 'open_time'] + [col for col in numeric_cols if 'return' in col and col != target_col]
-            feature_cols = [col for col in numeric_cols if col not in exclude_cols]
-            
-            self.logger.info(f"Excluded columns: {exclude_cols}")
-            self.logger.info(f"Feature columns selected: {len(feature_cols)}")
+        # Get feature columns (exclude non-feature columns)
+        exclude_cols = ['open_time', 'datetime'] + [col for col in features_df.columns if col.startswith('target_')]
+        feature_cols = [col for col in features_df.columns if col not in exclude_cols and features_df[col].dtype in ['float64', 'int64']]
         
-        # Check if we have enough features
-        if len(feature_cols) == 0:
-            raise ValueError("No feature columns available for training")
+        self.logger.info(f"Selected {len(feature_cols)} feature columns")
         
-        # Create target variable (shifted for prediction)
-        target = df[target_col].shift(-1)  # Predict next period return
-        self.logger.info(f"Target created, non-null values: {target.notna().sum()}")
+        # Align features and targets on index (datetime)
+        common_index = features_df.index.intersection(targets_df.index)
+        features_aligned = features_df.loc[common_index, feature_cols]
+        target_aligned = targets_df.loc[common_index, target_col]
         
-        # Align features and target
-        features = df[feature_cols].iloc[:-1]  # Remove last row due to shift
-        target = target.iloc[:-1]  # Remove last row due to shift
+        self.logger.info(f"After alignment: Features {features_aligned.shape}, Target {target_aligned.shape}")
         
-        self.logger.info(f"After alignment - Features shape: {features.shape}, Target shape: {target.shape}")
+        # Remove rows with missing target values
+        valid_target_mask = target_aligned.notna()
+        features_clean = features_aligned[valid_target_mask]
+        target_clean = target_aligned[valid_target_mask]
         
-        # Check for missing values before filtering
-        features_na_count = features.isna().sum().sum()
-        target_na_count = target.isna().sum()
-        self.logger.info(f"Missing values - Features: {features_na_count}, Target: {target_na_count}")
+        self.logger.info(f"After removing missing targets: Features {features_clean.shape}, Target {target_clean.shape}")
         
-        # Check individual feature null counts
-        null_counts = features.isnull().sum()
-        high_null_features = null_counts[null_counts > len(features) * 0.5]  # More than 50% null
-        if len(high_null_features) > 0:
-            self.logger.warning(f"Features with >50% null values: {dict(high_null_features)}")
+        # Remove rows with too many missing features (> 20% missing)
+        feature_missing_pct = features_clean.isnull().sum(axis=1) / len(feature_cols)
+        valid_feature_mask = feature_missing_pct < 0.2
         
-        # Remove rows with missing values
-        valid_idx = features.notna().all(axis=1) & target.notna()
-        self.logger.info(f"Valid rows before filtering: {len(features)}")
-        self.logger.info(f"Valid rows after filtering: {valid_idx.sum()}")
+        features_final = features_clean[valid_feature_mask]
+        target_final = target_clean[valid_feature_mask]
         
-        features = features[valid_idx]
-        target = target[valid_idx]
+        self.logger.info(f"After feature cleaning: Features {features_final.shape}, Target {target_final.shape}")
         
-        self.logger.info(f"Final shapes - Features: {features.shape}, Target: {target.shape}")
+        # Fill remaining missing values
+        if features_final.isnull().sum().sum() > 0:
+            features_final = features_final.fillna(method='ffill').fillna(features_final.median())
         
-        # If still empty, try more lenient filtering
-        if len(features) == 0:
-            self.logger.warning("No valid rows found with strict filtering, trying lenient approach")
-            
-            # Allow some missing values (less than 20% per row)
-            features = df[feature_cols].iloc[:-1]
-            target = df[target_col].shift(-1).iloc[:-1]
-            
-            # Remove rows where target is null or more than 20% of features are null
-            features_null_pct = features.isnull().sum(axis=1) / len(feature_cols)
-            valid_idx = target.notna() & (features_null_pct < 0.2)
-            
-            features = features[valid_idx]
-            target = target[valid_idx]
-            
-            # Fill remaining missing values with forward fill then median
-            features = features.fillna(method='ffill').fillna(features.median())
-            
-            self.logger.info(f"Lenient filtering - Final shapes: Features: {features.shape}, Target: {target.shape}")
+        # For classification tasks, ensure target is properly encoded
+        if task_type in ['classification_binary', 'classification_multi']:
+            if target_final.dtype == 'object':
+                from sklearn.preprocessing import LabelEncoder
+                le = LabelEncoder()
+                target_final = pd.Series(le.fit_transform(target_final), index=target_final.index)
+            target_final = target_final.astype(int)
         
-        if len(features) == 0:
+        if len(features_final) == 0:
             raise ValueError("No valid training data available after preprocessing")
         
-        return features, target, feature_cols
-
-    def train_lightgbm(self, X_train, y_train, X_val, y_val, params=None):
-        """Train LightGBM model"""
+        self.logger.info(f"Final dataset: {len(features_final)} samples, {len(feature_cols)} features")
+        self.logger.info(f"Target statistics: min={target_final.min():.4f}, max={target_final.max():.4f}, mean={target_final.mean():.4f}")
+        
+        return features_final, target_final, feature_cols, task_config
+    
+    def train_lightgbm(self, X_train, y_train, X_val, y_val, task_config, params=None):
+        """Train LightGBM model with task-specific configuration"""
         if params is None:
-            params = {
-                'objective': 'regression',
-                'metric': 'rmse',
-                'boosting_type': 'gbdt',
-                'num_leaves': 31,
-                'learning_rate': 0.05,
-                'feature_fraction': 0.9,
-                'bagging_fraction': 0.8,
-                'bagging_freq': 5,
-                'verbose': -1,
-                'random_state': 42
-            }
+            if task_config['task_type'] == 'classification_binary':
+                params = {
+                    'objective': 'binary',
+                    'metric': 'binary_logloss',
+                    'boosting_type': 'gbdt',
+                    'num_leaves': 31,
+                    'learning_rate': 0.05,
+                    'feature_fraction': 0.9,
+                    'bagging_fraction': 0.8,
+                    'bagging_freq': 5,
+                    'verbose': -1,
+                    'random_state': 42
+                }
+            elif task_config['task_type'] == 'classification_multi':
+                params = {
+                    'objective': 'multiclass',
+                    'num_class': 5,  # Adjust based on your classes
+                    'metric': 'multi_logloss',
+                    'boosting_type': 'gbdt',
+                    'num_leaves': 31,
+                    'learning_rate': 0.05,
+                    'feature_fraction': 0.9,
+                    'bagging_fraction': 0.8,
+                    'bagging_freq': 5,
+                    'verbose': -1,
+                    'random_state': 42
+                }
+            else:
+                # Regression (default)
+                params = {
+                    'objective': 'regression',
+                    'metric': 'rmse',
+                    'boosting_type': 'gbdt',
+                    'num_leaves': 31,
+                    'learning_rate': 0.05,
+                    'feature_fraction': 0.9,
+                    'bagging_fraction': 0.8,
+                    'bagging_freq': 5,
+                    'verbose': -1,
+                    'random_state': 42
+                }
+        
         train_data = lgb.Dataset(X_train, label=y_train)
         val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
         
@@ -524,18 +664,41 @@ class ModelTrainingPipeline:
         
         return model
 
-    def train_xgboost(self, X_train, y_train, X_val, y_val, params=None):
-        """Train XGBoost model"""
+    def train_xgboost(self, X_train, y_train, X_val, y_val, task_config, params=None):
+        """Train XGBoost model with task-specific configuration"""
         if params is None:
-            params = {
-                'objective': 'reg:squarederror',
-                'eval_metric': 'rmse',
-                'max_depth': 6,
-                'learning_rate': 0.05,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'random_state': 42
-            }
+            if task_config['task_type'] == 'classification_binary':
+                params = {
+                    'objective': 'binary:logistic',
+                    'eval_metric': 'logloss',
+                    'max_depth': 6,
+                    'learning_rate': 0.05,
+                    'subsample': 0.8,
+                    'colsample_bytree': 0.8,
+                    'random_state': 42
+                }
+            elif task_config['task_type'] == 'classification_multi':
+                params = {
+                    'objective': 'multi:softprob',
+                    'num_class': 5,  # Adjust based on your classes
+                    'eval_metric': 'mlogloss',
+                    'max_depth': 6,
+                    'learning_rate': 0.05,
+                    'subsample': 0.8,
+                    'colsample_bytree': 0.8,
+                    'random_state': 42
+                }
+            else:
+                # Regression (default)
+                params = {
+                    'objective': 'reg:squarederror',
+                    'eval_metric': 'rmse',
+                    'max_depth': 6,
+                    'learning_rate': 0.05,
+                    'subsample': 0.8,
+                    'colsample_bytree': 0.8,
+                    'random_state': 42
+                }
         
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dval = xgb.DMatrix(X_val, label=y_val)
@@ -550,21 +713,52 @@ class ModelTrainingPipeline:
         )
         
         return model
-
-    def evaluate_model(self, model, X_test, y_test, model_type='lightgbm'):
-        """Evaluate model performance"""
+    
+    def evaluate_model(self, model, X_test, y_test, model_type='lightgbm', task_config=None):
+        """Evaluate model performance based on task type"""
         if model_type == 'lightgbm':
-            y_pred = model.predict(X_test)
+            if task_config and task_config['task_type'] in ['classification_binary', 'classification_multi']:
+                y_pred_proba = model.predict(X_test)
+                y_pred = (y_pred_proba > 0.5).astype(int) if task_config['task_type'] == 'classification_binary' else np.argmax(y_pred_proba, axis=1)
+            else:
+                y_pred = model.predict(X_test)
+                
         elif model_type == 'xgboost':
-            dtest = xgb.DMatrix(X_test)
-            y_pred = model.predict(dtest)
+            if task_config and task_config['task_type'] in ['classification_binary', 'classification_multi']:
+                dtest = xgb.DMatrix(X_test)
+                y_pred_proba = model.predict(dtest)
+                y_pred = (y_pred_proba > 0.5).astype(int) if task_config['task_type'] == 'classification_binary' else np.argmax(y_pred_proba, axis=1)
+            else:
+                dtest = xgb.DMatrix(X_test)
+                y_pred = model.predict(dtest)
         
-        metrics = {
-            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
-            'mae': mean_absolute_error(y_test, y_pred),
-            'r2': r2_score(y_test, y_pred),
-            'directional_accuracy': np.mean(np.sign(y_pred) == np.sign(y_test))
-        }
+        # Calculate appropriate metrics based on task type
+        if task_config and task_config['task_type'] == 'classification_binary':
+            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+            metrics = {
+                'accuracy': accuracy_score(y_test, y_pred),
+                'precision': precision_score(y_test, y_pred, average='binary'),
+                'recall': recall_score(y_test, y_pred, average='binary'),
+                'f1': f1_score(y_test, y_pred, average='binary'),
+                'auc': roc_auc_score(y_test, y_pred_proba if 'y_pred_proba' in locals() else y_pred)
+            }
+        elif task_config and task_config['task_type'] == 'classification_multi':
+            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+            metrics = {
+                'accuracy': accuracy_score(y_test, y_pred),
+                'precision': precision_score(y_test, y_pred, average='weighted'),
+                'recall': recall_score(y_test, y_pred, average='weighted'), 
+                'f1': f1_score(y_test, y_pred, average='weighted')
+            }
+        else:
+            # Regression metrics
+            metrics = {
+                'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
+                'mae': mean_absolute_error(y_test, y_pred),
+                'r2': r2_score(y_test, y_pred)
+            }
+            if len(y_test) > 0:
+                metrics['directional_accuracy'] = np.mean(np.sign(y_pred) == np.sign(y_test))
         
         return metrics, y_pred
 
@@ -678,88 +872,250 @@ class ModelTrainingPipeline:
             return model_path, metadata_path, None, None
 
     # Update your train_symbol_models method to use the new save method
-    def train_symbol_models(self, symbol, dvc_version_id):
-        """Train all model types for a single symbol using DVC versioned features"""
-        self.logger.info(f"Starting model training for {symbol} using DVC version {dvc_version_id}")
+    def train_symbol_models(self, symbol, feature_version_id, target_version_id=None, tasks_to_train='all', task_types=None):
+        """Train multiple models with validation checks"""
+        self.logger.info(f"Starting multi-task model training for {symbol} using version {feature_version_id}")
         
-        # Load features from DVC (with fallback)
-        df, feature_metadata = self.load_features_from_dvc_fallback(dvc_version_id)
+        # Load features and targets
+        features_df, targets_df, feature_metadata = self.load_features_and_targets_from_dvc(feature_version_id, target_version_id)
         
-        # Prepare training data
-        features, target, feature_cols = self.prepare_training_data(df)
+        # Determine which tasks to train
+        if tasks_to_train == 'all' or tasks_to_train is None:
+            tasks_to_train = list(PREDICTION_CONFIGS.keys())
+        elif isinstance(tasks_to_train, str) and tasks_to_train != 'all':
+            tasks_to_train = [tasks_to_train]
         
-        # Split data (80/20 train/test)
-        split_idx = int(0.8 * len(features))
-        X_train, X_test = features.iloc[:split_idx], features.iloc[split_idx:]
-        y_train, y_test = target.iloc[:split_idx], target.iloc[split_idx:]
+        # Filter by task type if specified
+        if task_types is not None:
+            if isinstance(task_types, str):
+                task_types = [task_types]
+            
+            filtered_tasks = []
+            for task_name in tasks_to_train:
+                if task_name in PREDICTION_CONFIGS:
+                    if PREDICTION_CONFIGS[task_name]['task_type'] in task_types:
+                        filtered_tasks.append(task_name)
+            tasks_to_train = filtered_tasks
         
+        self.logger.info(f"Training {len(tasks_to_train)} tasks: {tasks_to_train}")
+        
+        # VALIDATION STEP 1: Validate features and targets separately
+        self.logger.info("Running data validation...")
+        
+        features_validation = self.validator.run_validation_suite(
+            features_df, f"features_{symbol}", symbol, dataset_type='features'
+        )
+        
+        targets_validation = self.validator.run_validation_suite(
+            targets_df, f"targets_{symbol}", symbol, dataset_type='targets'
+        )
+        
+        # VALIDATION STEP 2: Check training readiness for selected tasks
+        selected_task_configs = [PREDICTION_CONFIGS[task] for task in tasks_to_train if task in PREDICTION_CONFIGS]
+        
+        training_readiness = self.validator.validate_model_training_readiness(
+            features_df, targets_df, selected_task_configs, symbol
+        )
+        
+        # Check if there are critical validation failures
+        critical_failures = (
+            features_validation['critical_failures'] + 
+            targets_validation['critical_failures'] + 
+            (1 if not training_readiness['ready_for_training'] else 0)
+        )
+        
+        if critical_failures > 0:
+            error_msg = f"Critical validation failures detected: {critical_failures} issues"
+            self.logger.error(error_msg)
+            
+            # Log validation summaries
+            self.logger.error(f"Features validation: {features_validation['summary']}")
+            self.logger.error(f"Targets validation: {targets_validation['summary']}")
+            self.logger.error(f"Training readiness: {training_readiness['summary']}")
+            
+            # You can choose to either raise an exception or continue with warnings
+            raise ValueError(f"Data validation failed: {error_msg}")
+        
+        # Log validation success
+        self.logger.info(f"Data validation passed:")
+        self.logger.info(f"- Features: {features_validation['summary']}")
+        self.logger.info(f"- Targets: {targets_validation['summary']}")
+        self.logger.info(f"- Training readiness: {training_readiness['summary']}")
+        
+        # Continue with existing training logic...
         results = {
             'symbol': symbol,
-            'dvc_version_id': dvc_version_id,
+            'feature_version_id': feature_version_id,
+            'target_version_id': target_version_id,
             'training_timestamp': datetime.now().isoformat(),
-            'data_shape': features.shape,
+            'data_shape': features_df.shape,
             'feature_metadata': feature_metadata,
-            'models': {}
+            'validation_results': {
+                'features': features_validation,
+                'targets': targets_validation,
+                'training_readiness': training_readiness
+            },
+            'tasks': {}
         }
         
-        # Train LightGBM
-        try:
-            self.logger.info(f"Training LightGBM for {symbol}")
-            lgb_model = self.train_lightgbm(X_train, y_train, X_test, y_test)
-            lgb_metrics, _ = self.evaluate_model(lgb_model, X_test, y_test, 'lightgbm')
+        # Train models for each task
+        for task_name in tasks_to_train:
+            if task_name not in PREDICTION_CONFIGS:
+                self.logger.warning(f"Unknown task: {task_name}")
+                continue
+                
+            task_config = PREDICTION_CONFIGS[task_name]
             
-            # Cross validation
-            lgb_cv_metrics, _ = self.cross_validate_model(features, target, 'lightgbm')
-            lgb_metrics.update(lgb_cv_metrics)
-            
-            # Save model with MLflow registry
-            lgb_model_path, lgb_metadata_path, lgb_mlflow_run, lgb_mlflow_uri = self.save_model_with_mlflow_registry(
-                lgb_model, symbol, 'lightgbm', lgb_metrics, feature_cols, dvc_version_id, features, target
-            )
-            
-            results['models']['lightgbm'] = {
-                'metrics': lgb_metrics,
-                'model_path': lgb_model_path,
-                'metadata_path': lgb_metadata_path,
-                'mlflow_run_id': lgb_mlflow_run,
-                'mlflow_model_uri': lgb_mlflow_uri,
-                'registered_name': f"crypto_lightgbm_{symbol}"
-            }
-            
-        except Exception as e:
-            self.logger.error(f"LightGBM training failed for {symbol}: {e}")
-            # Don't raise, continue with XGBoost
-        
-        # Train XGBoost
-        try:
-            self.logger.info(f"Training XGBoost for {symbol}")
-            xgb_model = self.train_xgboost(X_train, y_train, X_test, y_test)
-            xgb_metrics, _ = self.evaluate_model(xgb_model, X_test, y_test, 'xgboost')
-            
-            # Cross validation
-            xgb_cv_metrics, _ = self.cross_validate_model(features, target, 'xgboost')
-            xgb_metrics.update(xgb_cv_metrics)
-            
-            # Save model with MLflow registry
-            xgb_model_path, xgb_metadata_path, xgb_mlflow_run, xgb_mlflow_uri = self.save_model_with_mlflow_registry(
-                xgb_model, symbol, 'xgboost', xgb_metrics, feature_cols, dvc_version_id, features, target
-            )
-            
-            results['models']['xgboost'] = {
-                'metrics': xgb_metrics,
-                'model_path': xgb_model_path,
-                'metadata_path': xgb_metadata_path,
-                'mlflow_run_id': xgb_mlflow_run,
-                'mlflow_model_uri': xgb_mlflow_uri,
-                'registered_name': f"crypto_xgboost_{symbol}"
-            }
-            
-        except Exception as e:
-            self.logger.error(f"XGBoost training failed for {symbol}: {e}")
+            try:
+                self.logger.info(f"Training {task_name} for {symbol}")
+                
+                # Prepare data for this specific task (with additional validation)
+                features, target, feature_cols, task_info = self.prepare_training_data_validated(
+                    features_df, targets_df, task_config, symbol
+                )
+                
+                # Split data (80/20 train/test, time-aware)
+                split_idx = int(0.8 * len(features))
+                X_train, X_test = features.iloc[:split_idx], features.iloc[split_idx:]
+                y_train, y_test = target.iloc[:split_idx], target.iloc[split_idx:]
+                
+                task_results = {'task_config': task_config, 'models': {}}
+                
+                # Train different model types for this task
+                for model_type in ['lightgbm', 'xgboost']:
+                    try:
+                        if model_type == 'lightgbm':
+                            model = self.train_lightgbm(X_train, y_train, X_test, y_test, task_config)
+                        elif model_type == 'xgboost':
+                            model = self.train_xgboost(X_train, y_train, X_test, y_test, task_config)
+                        
+                        # Evaluate model
+                        metrics, predictions = self.evaluate_model(model, X_test, y_test, model_type, task_config)
+                        
+                        # Save model with MLflow
+                        model_path, metadata_path, mlflow_run, mlflow_uri = self.save_model_with_mlflow_registry(
+                            model, symbol, f"{model_type}_{task_name}", metrics, feature_cols,
+                            feature_version_id, features, target
+                        )
+                        
+                        task_results['models'][model_type] = {
+                            'metrics': metrics,
+                            'model_path': model_path,
+                            'metadata_path': metadata_path,
+                            'mlflow_run_id': mlflow_run,
+                            'mlflow_model_uri': mlflow_uri,
+                            'registered_name': f"crypto_{model_type}_{task_name}_{symbol}"
+                        }
+                        
+                    except Exception as e:
+                        self.logger.error(f"{model_type} training failed for {task_name}/{symbol}: {e}")
+                
+                results['tasks'][task_name] = task_results
+                
+            except Exception as e:
+                self.logger.error(f"Task {task_name} failed for {symbol}: {e}")
         
         return results
 
-    def run_training_pipeline(self, dvc_versioning_summary):
+    # ADD new method with additional validation during data preparation:
+    def prepare_training_data_validated(self, features_df, targets_df, task_config, symbol):
+        """Prepare training data with additional validation steps"""
+        
+        # Run the standard preparation
+        features, target, feature_cols, task_info = self.prepare_training_data(
+            features_df, targets_df, task_config
+        )
+        
+        # Additional validation on prepared data
+        target_col = task_config['target_col']
+        task_type = task_config['task_type']
+        
+        # Validate final data quality
+        if len(features) < 500:
+            self.logger.warning(f"Small training dataset for {symbol}/{target_col}: {len(features)} samples")
+        
+        # Check for data leakage (features correlated too highly with targets)
+        if task_type == 'regression':
+            # For regression, check correlation between features and targets
+            correlations = features.corrwith(target).abs()
+            high_corr_features = correlations[correlations > 0.95]  # Suspiciously high correlation
+            
+            if len(high_corr_features) > 0:
+                self.logger.warning(f"Potential data leakage detected in {symbol}/{target_col}:")
+                for feat, corr in high_corr_features.items():
+                    self.logger.warning(f"  {feat}: {corr:.3f} correlation with target")
+        
+        # Validate target distribution for classification
+        if task_type in ['classification_binary', 'classification_multi']:
+            class_counts = target.value_counts()
+            min_class_size = class_counts.min()
+            total_samples = len(target)
+            
+            if min_class_size < 50:
+                self.logger.warning(f"Small class size in {symbol}/{target_col}: minimum class has {min_class_size} samples")
+            
+            # Check for class imbalance
+            class_imbalance_ratio = class_counts.max() / class_counts.min()
+            if class_imbalance_ratio > 10:
+                self.logger.warning(f"High class imbalance in {symbol}/{target_col}: ratio {class_imbalance_ratio:.1f}:1")
+        
+        self.logger.info(f"Training data validation passed for {symbol}/{target_col}")
+        
+        return features, target, feature_cols, task_info
+
+    # ADD method to validate pipeline results:
+    def validate_training_results(self, results):
+        """Validate training results for quality checks"""
+        validation_summary = {
+            'symbol': results['symbol'],
+            'validation_timestamp': datetime.now().isoformat(),
+            'tasks_trained': len(results['tasks']),
+            'models_trained': 0,
+            'failed_tasks': [],
+            'poor_performance_models': [],
+            'validation_warnings': []
+        }
+        
+        for task_name, task_results in results['tasks'].items():
+            task_config = PREDICTION_CONFIGS.get(task_name, {})
+            task_type = task_config.get('task_type', 'regression')
+            
+            for model_type, model_info in task_results.get('models', {}).items():
+                validation_summary['models_trained'] += 1
+                metrics = model_info.get('metrics', {})
+                
+                # Validate model performance based on task type
+                if task_type == 'regression':
+                    r2 = metrics.get('r2', 0)
+                    if r2 < 0.01:  # Very low R² suggests poor model
+                        validation_summary['poor_performance_models'].append({
+                            'model': f"{model_type}_{task_name}",
+                            'issue': f"Low R²: {r2:.4f}",
+                            'metrics': metrics
+                        })
+                
+                elif task_type == 'classification_binary':
+                    accuracy = metrics.get('accuracy', 0)
+                    if accuracy < 0.55:  # Barely better than random
+                        validation_summary['poor_performance_models'].append({
+                            'model': f"{model_type}_{task_name}",
+                            'issue': f"Low accuracy: {accuracy:.3f}",
+                            'metrics': metrics
+                        })
+                
+                # Check for overfitting indicators (you'd need validation metrics for this)
+                # This is a placeholder for more sophisticated validation
+        
+        # Log validation summary
+        if validation_summary['poor_performance_models']:
+            self.logger.warning(f"Training validation found {len(validation_summary['poor_performance_models'])} poor-performing models")
+            for model_issue in validation_summary['poor_performance_models']:
+                self.logger.warning(f"  {model_issue['model']}: {model_issue['issue']}")
+        
+        results['training_validation'] = validation_summary
+        return results   
+    
+    def run_training_pipeline(self, dvc_versioning_summary, enable_validation=True):
         """Run training pipeline using DVC versioned features"""
         training_results = {
             'pipeline_timestamp': datetime.now().isoformat(),
@@ -775,17 +1131,22 @@ class ModelTrainingPipeline:
             raise ValueError("No DVC feature version IDs found in versioning summary")
         
         # Map version IDs to symbols (assuming version ID format: features_SYMBOL_timestamp_hash)
-        for version_id in feature_version_ids:
+        for feature_version_id in feature_version_ids:
             try:
                 # Extract symbol from version ID
-                symbol = version_id.split('_')[1]  # features_SYMBOL_timestamp_hash
+                symbol = feature_version_id.split('_')[1]  # features_SYMBOL_timestamp_hash
+
+                symbol_results = self.train_symbol_models(symbol, feature_version_id)
+            
+                # Validate training results if enabled
+                if enable_validation:
+                    symbol_results = self.validate_training_results(symbol_results)
                 
-                symbol_results = self.train_symbol_models(symbol, version_id)
                 training_results['symbols_trained'].append(symbol)
                 training_results['model_results'][symbol] = symbol_results
                 
             except Exception as e:
-                self.logger.error(f"Training failed for version {version_id}: {e}")
+                self.logger.error(f"Training failed for version {feature_version_id}: {e}")
                 continue
         
         self.logger.info(f"Training pipeline completed for {len(training_results['symbols_trained'])} symbols")
