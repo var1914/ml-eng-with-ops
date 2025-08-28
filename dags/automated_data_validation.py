@@ -332,13 +332,13 @@ class DataValidationSuite:
         return results
     
     def run_validation_suite(self, df: pd.DataFrame, dataset_name: str, symbol: str = None, 
-                           reference_stats: Dict = None) -> Dict[str, Any]:
-        """Run complete validation suite"""
+                        reference_stats: Dict = None, dataset_type: str = 'features') -> Dict[str, Any]:
+        """Run complete validation suite with dataset type awareness"""
         
         all_results = []
         
         # Define validation rules based on dataset type
-        if 'raw_data' in dataset_name:
+        if dataset_type == 'raw_data' or 'raw_data' in dataset_name:
             schema_rules = {
                 'required_columns': ['close_price', 'volume', 'open_time'],
                 'dtypes': {'close_price': 'float', 'volume': 'float'},
@@ -350,9 +350,21 @@ class DataValidationSuite:
                 'outlier_z_threshold': 4.0,
                 'max_outlier_percentage': 1.0
             }
+        elif dataset_type == 'targets' or 'targets' in dataset_name:
+            # NEW: Validation rules for target datasets
+            schema_rules = {
+                'required_columns': ['target_return_4steps'],  # At least one target should exist
+                'min_rows': 100
+            }
+            quality_rules = {
+                'max_null_percentage': 30.0,  # Targets can have more nulls due to forward-looking nature
+                'max_duplicate_percentage': 5.0,
+                'outlier_z_threshold': 3.0,
+                'max_outlier_percentage': 5.0
+            }
         else:  # features
             schema_rules = {
-                'required_columns': ['close_price', 'rsi_14', 'volume'],
+                'required_columns': ['close_price'],  # Basic price data should be present
                 'min_rows': 100
             }
             quality_rules = {
@@ -362,13 +374,17 @@ class DataValidationSuite:
                 'max_outlier_percentage': 3.0
             }
         
-        # Run validations
+        # Run standard validations
         all_results.extend(self.validate_schema(df, schema_rules, dataset_name))
         all_results.extend(self.validate_data_quality(df, quality_rules, dataset_name))
         
         if symbol:
             all_results.extend(self.validate_crypto_specific(df, symbol))
             all_results.extend(self.validate_temporal_consistency(df, symbol))
+        
+        # NEW: Run target-specific validation if this is a targets dataset
+        if dataset_type == 'targets' or 'targets' in dataset_name:
+            all_results.extend(self.validate_target_data(df, symbol))
         
         if reference_stats:
             all_results.extend(self.validate_statistical_drift(df, reference_stats, symbol))
@@ -381,6 +397,7 @@ class DataValidationSuite:
         
         return {
             'dataset_name': dataset_name,
+            'dataset_type': dataset_type,
             'symbol': symbol,
             'validation_time': datetime.now().isoformat(),
             'total_rules': len(all_results),
@@ -475,6 +492,224 @@ class DataValidationSuite:
             self.logger.error(f"Failed to get validation history: {str(e)}")
             return []
 
+    def validate_target_data(self, df: pd.DataFrame, symbol: str) -> List[ValidationResult]:
+        """Validate multi-horizon target data"""
+        results = []
+        
+        # Check for target columns with proper naming
+        expected_target_prefixes = ['target_return_', 'target_direction_', 'target_volatility_', 'target_vol_regime_']
+        target_columns = [col for col in df.columns if any(col.startswith(prefix) for prefix in expected_target_prefixes)]
+        
+        if not target_columns:
+            results.append(ValidationResult(
+                rule_name="target_columns_exist",
+                severity=ValidationSeverity.CRITICAL,
+                passed=False,
+                message="No target columns found in dataset",
+                details={"expected_prefixes": expected_target_prefixes},
+                timestamp=datetime.now()
+            ))
+            return results
+        
+        # Validate target column naming convention
+        valid_horizons = ['1steps', '4steps', '16steps', '96steps']
+        for col in target_columns:
+            horizon_found = any(horizon in col for horizon in valid_horizons)
+            if not horizon_found:
+                results.append(ValidationResult(
+                    rule_name="target_naming_convention",
+                    severity=ValidationSeverity.WARNING,
+                    passed=False,
+                    message=f"Target column {col} doesn't follow naming convention",
+                    details={"column": col, "expected_horizons": valid_horizons},
+                    timestamp=datetime.now()
+                ))
+        
+        # Validate return targets (should be reasonable ranges)
+        return_columns = [col for col in target_columns if 'target_return_' in col]
+        for col in return_columns:
+            if col in df.columns and not df[col].empty:
+                # Returns should typically be between -50% and +50% for crypto
+                extreme_returns = ((df[col] < -0.5) | (df[col] > 0.5)).sum()
+                if extreme_returns > 0:
+                    extreme_pct = (extreme_returns / len(df)) * 100
+                    severity = ValidationSeverity.CRITICAL if extreme_pct > 1.0 else ValidationSeverity.WARNING
+                    
+                    results.append(ValidationResult(
+                        rule_name="return_targets_range",
+                        severity=severity,
+                        passed=False,
+                        message=f"Column {col} has {extreme_returns} extreme returns (>50% or <-50%)",
+                        details={"column": col, "extreme_count": extreme_returns, "extreme_percentage": extreme_pct},
+                        timestamp=datetime.now()
+                    ))
+        
+        # Validate direction targets (should be 0 or 1 for binary)
+        direction_columns = [col for col in target_columns if 'target_direction_' in col and 'multi' not in col]
+        for col in direction_columns:
+            if col in df.columns and not df[col].empty:
+                unique_values = df[col].dropna().unique()
+                if not all(val in [0, 1] for val in unique_values):
+                    results.append(ValidationResult(
+                        rule_name="direction_targets_binary",
+                        severity=ValidationSeverity.CRITICAL,
+                        passed=False,
+                        message=f"Binary direction column {col} contains non-binary values",
+                        details={"column": col, "unique_values": unique_values.tolist()},
+                        timestamp=datetime.now()
+                    ))
+        
+        # Validate multi-class direction targets (should be 0-4)
+        direction_multi_columns = [col for col in target_columns if 'target_direction_multi_' in col]
+        for col in direction_multi_columns:
+            if col in df.columns and not df[col].empty:
+                unique_values = df[col].dropna().unique()
+                expected_values = [0, 1, 2, 3, 4]  # strong_down, down, neutral, up, strong_up
+                if not all(val in expected_values for val in unique_values):
+                    results.append(ValidationResult(
+                        rule_name="direction_multi_targets_range",
+                        severity=ValidationSeverity.CRITICAL,
+                        passed=False,
+                        message=f"Multi-class direction column {col} contains invalid values",
+                        details={"column": col, "unique_values": unique_values.tolist(), "expected": expected_values},
+                        timestamp=datetime.now()
+                    ))
+        
+        # Validate volatility targets (should be positive)
+        volatility_columns = [col for col in target_columns if 'target_volatility_' in col]
+        for col in volatility_columns:
+            if col in df.columns and not df[col].empty:
+                negative_vol = (df[col] < 0).sum()
+                if negative_vol > 0:
+                    results.append(ValidationResult(
+                        rule_name="volatility_targets_positive",
+                        severity=ValidationSeverity.CRITICAL,
+                        passed=False,
+                        message=f"Volatility column {col} contains negative values",
+                        details={"column": col, "negative_count": negative_vol},
+                        timestamp=datetime.now()
+                    ))
+        
+        # Check for sufficient non-null targets across horizons
+        for horizon in valid_horizons:
+            horizon_columns = [col for col in target_columns if horizon in col]
+            if horizon_columns:
+                for col in horizon_columns:
+                    if col in df.columns:
+                        null_pct = (df[col].isnull().sum() / len(df)) * 100
+                        max_null_pct = 30.0  # Allow more nulls in targets due to forward-looking nature
+                        
+                        if null_pct > max_null_pct:
+                            results.append(ValidationResult(
+                                rule_name="target_null_percentage",
+                                severity=ValidationSeverity.WARNING,
+                                passed=False,
+                                message=f"Target column {col} has high null percentage: {null_pct:.2f}%",
+                                details={"column": col, "null_percentage": null_pct, "threshold": max_null_pct},
+                                timestamp=datetime.now()
+                            ))
+        
+        return results
+
+    # ADD method to be called from model training pipeline:
+    def validate_model_training_readiness(self, features_df: pd.DataFrame, targets_df: pd.DataFrame,
+                                        task_configs: List[Dict], symbol: str) -> Dict[str, Any]:
+        """Validate readiness for model training across multiple tasks"""
+        all_results = []
+        
+        # Run alignment validation for each task
+        for task_config in task_configs:
+            task_results = self.validate_training_data_alignment(features_df, targets_df, task_config, symbol)
+            all_results.extend(task_results)
+        
+        # Store results
+        dataset_name = f"training_readiness_{symbol}"
+        self._store_validation_results(all_results, dataset_name, symbol)
+        
+        # Generate summary
+        summary = self._generate_validation_summary(all_results)
+        
+        return {
+            'dataset_name': dataset_name,
+            'symbol': symbol,
+            'validation_time': datetime.now().isoformat(),
+            'tasks_validated': len(task_configs),
+            'total_rules': len(all_results),
+            'passed_rules': len([r for r in all_results if r.passed]),
+            'failed_rules': len([r for r in all_results if not r.passed]),
+            'critical_failures': len([r for r in all_results if not r.passed and r.severity == ValidationSeverity.CRITICAL]),
+            'warnings': len([r for r in all_results if not r.passed and r.severity == ValidationSeverity.WARNING]),
+            'summary': summary,
+            'ready_for_training': len([r for r in all_results if not r.passed and r.severity == ValidationSeverity.CRITICAL]) == 0
+        }
+
+    def validate_training_data_alignment(self, features_df: pd.DataFrame, targets_df: pd.DataFrame, 
+                                    task_config: Dict, symbol: str) -> List[ValidationResult]:
+        """Validate alignment between features and targets for training"""
+        results = []
+        
+        target_col = task_config['target_col']
+        
+        # Check if target column exists
+        if target_col not in targets_df.columns:
+            results.append(ValidationResult(
+                rule_name="target_column_exists",
+                severity=ValidationSeverity.CRITICAL,
+                passed=False,
+                message=f"Target column {target_col} not found in targets dataset",
+                details={"target_col": target_col, "available_columns": list(targets_df.columns)},
+                timestamp=datetime.now()
+            ))
+            return results
+        
+        # Check temporal alignment
+        features_start = features_df.index.min()
+        features_end = features_df.index.max()
+        targets_start = targets_df.index.min()
+        targets_end = targets_df.index.max()
+        
+        # Features should start before or at the same time as targets
+        if features_start > targets_start:
+            results.append(ValidationResult(
+                rule_name="temporal_alignment_start",
+                severity=ValidationSeverity.WARNING,
+                passed=False,
+                message="Features start after targets - potential alignment issue",
+                details={"features_start": features_start.isoformat(), "targets_start": targets_start.isoformat()},
+                timestamp=datetime.now()
+            ))
+        
+        # Check overlap period
+        common_index = features_df.index.intersection(targets_df.index)
+        overlap_pct = (len(common_index) / max(len(features_df), len(targets_df))) * 100
+        
+        if overlap_pct < 80.0:  # Less than 80% overlap is concerning
+            results.append(ValidationResult(
+                rule_name="features_targets_overlap",
+                severity=ValidationSeverity.WARNING,
+                passed=False,
+                message=f"Low overlap between features and targets: {overlap_pct:.1f}%",
+                details={"overlap_percentage": overlap_pct, "common_periods": len(common_index)},
+                timestamp=datetime.now()
+            ))
+        
+        # Check for sufficient non-null aligned data
+        if len(common_index) > 0:
+            aligned_target = targets_df.loc[common_index, target_col]
+            valid_target_pct = (aligned_target.notna().sum() / len(aligned_target)) * 100
+            
+            if valid_target_pct < 70.0:  # Less than 70% valid targets
+                results.append(ValidationResult(
+                    rule_name="aligned_target_completeness",
+                    severity=ValidationSeverity.WARNING,
+                    passed=False,
+                    message=f"Low valid target percentage in aligned data: {valid_target_pct:.1f}%",
+                    details={"valid_target_percentage": valid_target_pct, "target_column": target_col},
+                    timestamp=datetime.now()
+                ))
+        
+        return results
+
 # Integration functions
 def validate_raw_data(db_config: Dict, symbols: List[str]) -> Dict[str, Any]:
     """Validate raw crypto data for all symbols"""
@@ -507,14 +742,15 @@ def validate_raw_data(db_config: Dict, symbols: List[str]) -> Dict[str, Any]:
     
     return results
 
-def validate_feature_data(db_config: Dict, feature_results: Dict) -> Dict[str, Any]:
-    """Validate engineered features"""
+def validate_feature_and_target_data(db_config: Dict, pipeline_results: Dict) -> Dict[str, Any]:
+    """Validate both engineered features and targets"""
     validator = DataValidationSuite(db_config)
     results = {}
     
     minio_client = Minio('minio:9000', access_key='admin', secret_key='admin123', secure=False)
     
-    for symbol, storage_path in feature_results['storage_paths'].items():
+    # Validate features
+    for symbol, storage_path in pipeline_results['storage_paths'].items():
         try:
             # Load features from MinIO
             response = minio_client.get_object('crypto-features', storage_path)
@@ -522,17 +758,34 @@ def validate_feature_data(db_config: Dict, feature_results: Dict) -> Dict[str, A
             response.close()
             response.release_conn()
             
-            # Get reference statistics for drift detection
-            reference_stats = None  # Could load from previous validation
-            
-            # Run validation
+            # Run feature validation
             validation_result = validator.run_validation_suite(
-                df, f"features_{symbol}", symbol, reference_stats
+                df, f"features_{symbol}", symbol, dataset_type='features'
             )
-            results[symbol] = validation_result
+            results[f"{symbol}_features"] = validation_result
             
         except Exception as e:
             logging.getLogger().error(f"Failed to validate features for {symbol}: {e}")
             continue
+    
+    # Validate targets (if they exist)
+    if 'target_paths' in pipeline_results:
+        for symbol, target_path in pipeline_results['target_paths'].items():
+            try:
+                # Load targets from MinIO
+                response = minio_client.get_object('crypto-features', target_path)
+                df = pd.read_parquet(BytesIO(response.read()))
+                response.close()
+                response.release_conn()
+                
+                # Run target validation
+                validation_result = validator.run_validation_suite(
+                    df, f"targets_{symbol}", symbol, dataset_type='targets'
+                )
+                results[f"{symbol}_targets"] = validation_result
+                
+            except Exception as e:
+                logging.getLogger().error(f"Failed to validate targets for {symbol}: {e}")
+                continue
     
     return results

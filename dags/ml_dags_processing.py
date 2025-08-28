@@ -10,7 +10,7 @@ from data_quality import DataQualityAssessment
 from feature_eng import FeatureEngineeringPipeline
 from viz import DataQualityMonitoring, FeatureEngineeringMonitoring, ValidationMonitoring, ModelTrainingMonitoring, ModelLifecycleMonitoring, ComprehensiveMonitoring
 from data_versioning import DVCDataVersioning, dvc_version_raw_data, dvc_version_features_data
-from automated_data_validation import validate_raw_data, validate_feature_data
+from automated_data_validation import validate_raw_data, validate_feature_and_target_data
 from model_training import ModelTrainingPipeline
 
 DB_CONFIG = {
@@ -74,7 +74,7 @@ def run_feature_data_validation(**context):
             raise ValueError("No feature results found for validation")
         
         logger.info("Starting feature data validation...")
-        validation_results = validate_feature_data(DB_CONFIG, feature_results)
+        validation_results = validate_feature_and_target_data(DB_CONFIG, feature_results)
         
         # Check for critical failures
         critical_failures = []
@@ -122,8 +122,8 @@ def run_feature_engineering(**context):
     """Run feature engineering pipeline and return results via XCom"""
     try:
         pipeline = FeatureEngineeringPipeline(DB_CONFIG)
-        feature_results = pipeline.run_feature_pipeline(SYMBOLS)
-        
+        feature_results = pipeline.run_feature_pipeline(SYMBOLS, create_targets=True)
+
         logger.info(f"Feature engineering completed for {len(SYMBOLS)} symbols")
         
         # Push results to XCom for downstream tasks
