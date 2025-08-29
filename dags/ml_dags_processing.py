@@ -12,6 +12,7 @@ from viz import DataQualityMonitoring, FeatureEngineeringMonitoring, ValidationM
 from data_versioning import DVCDataVersioning, dvc_version_raw_data, dvc_version_features_data
 from automated_data_validation import validate_raw_data, validate_feature_and_target_data
 from model_training import ModelTrainingPipeline
+from model_promotion import ModelPromotion
 
 DB_CONFIG = {
     "dbname": "postgres",
@@ -100,7 +101,6 @@ def run_feature_data_validation(**context):
     except Exception as e:
         logger.error(f"Feature data validation failed: {str(e)}")
         raise
-
 
 def run_data_quality_assessment(**context):
     """Run data quality assessment and return results via XCom"""
@@ -201,6 +201,12 @@ def run_model_training(**context):
         logger.error(f"Model training with MLflow failed: {str(e)}")
         raise
 
+def promote_models(**context):
+    training_results = context['task_instance'].xcom_pull(task_ids='model_training')
+    model_promotion = ModelPromotion(DB_CONFIG)
+    model_promotion.promote_models_to_staging(training_results)
+    logger.info("Model promotion completed successfully")
+
 
 def log_monitoring_metrics(**context):
     """Log monitoring metrics using results from upstream tasks"""
@@ -289,7 +295,6 @@ def log_monitoring_metrics(**context):
         logger.error(f"Comprehensive monitoring failed: {str(e)}")
         raise
 
-
 default_args = {
     'owner': 'varunrajput',
     'depends_on_past': False,
@@ -345,6 +350,13 @@ model_training_task = PythonOperator(
     dag=dag,
 )
 
+promote_models_to_staging = PythonOperator(
+    task_id='promote_models',
+    python_callable=promote_models,
+    op_kwargs={'training_results': '{{ task_instance.xcom_pull(task_ids="model_training") }}'},
+    dag=dag,
+)
+
 monitoring_task = PythonOperator(
     task_id='logging_monitoring',
     python_callable=log_monitoring_metrics,
@@ -352,4 +364,4 @@ monitoring_task = PythonOperator(
 )
 
 # Define task dependencies - updated to include versioning
-data_quality_task >> raw_data_validation_task >> feature_engineering_task >> feature_data_validation_task >> data_versioning_task >> model_training_task >> monitoring_task
+data_quality_task >> raw_data_validation_task >> feature_engineering_task >> feature_data_validation_task >> data_versioning_task >> model_training_task >> promote_models_to_staging >> monitoring_task

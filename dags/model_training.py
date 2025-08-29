@@ -109,39 +109,27 @@ class MLflowModelRegistry:
             raise
     
     def log_model_with_registry(self, model, model_type, symbol, features, target, 
-                               metrics, feature_cols, dvc_version_id, model_path):
-        """Log model to MLflow with full registry features"""
+                            metrics, feature_cols, dvc_version_id, model_path):
+        """Log model to MLflow with full registry features for multi-task models"""
+        
+        # Parse composite model_type (e.g., "xgboost_vol_regime_4step")
+        # Format: {algorithm}_{task_name}
+        parts = model_type.split('_', 1)  # Split on first underscore only
+        algorithm = parts[0]  # e.g., "xgboost" 
+        task_name = parts[1] if len(parts) > 1 else "unknown"  # e.g., "vol_regime_4step"
+        
+        # Get task configuration for parameters
+        task_config = PREDICTION_CONFIGS.get(task_name, {})
+        task_type = task_config.get('task_type', 'regression')
         
         experiment_name = f"crypto_multi_models_{symbol}"
         experiment_id = self.create_experiment_if_not_exists(experiment_name)
-        params = {}
+        
         with mlflow.start_run(experiment_id=experiment_id, 
-                             run_name=f"{model_type}_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}") as run:
+                            run_name=f"{model_type}_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}") as run:
             
-            # 1. Log parameters
-            if model_type == 'lightgbm':
-                params = {
-                    'objective': 'regression',
-                    'metric': 'rmse',
-                    'boosting_type': 'gbdt',
-                    'num_leaves': 31,
-                    'learning_rate': 0.05,
-                    'feature_fraction': 0.9,
-                    'bagging_fraction': 0.8,
-                    'bagging_freq': 5,
-                    'random_state': 42
-                }
-            elif model_type == 'xgboost':
-                params = {
-                    'objective': 'reg:squarederror',
-                    'eval_metric': 'rmse',
-                    'max_depth': 6,
-                    'learning_rate': 0.05,
-                    'subsample': 0.8,
-                    'colsample_bytree': 0.8,
-                    'random_state': 42
-                }
-            
+            # 1. Log parameters based on algorithm and task type
+            params = self._get_model_params(algorithm, task_type)
             mlflow.log_params(params)
             
             # 2. Log metrics
@@ -149,51 +137,130 @@ class MLflowModelRegistry:
                 mlflow.log_metric(metric_name, metric_value)
             
             # 3. Log feature importance (if available)
-            if hasattr(model, 'feature_importance'):
-                feature_importance = model.feature_importance()
-                importance_dict = dict(zip(feature_cols, feature_importance))
-                
-                # Log top 10 most important features
-                sorted_importance = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:10]
-                for feat, importance in sorted_importance:
-                    mlflow.log_metric(f"feature_importance_{feat}", importance)
+            self._log_feature_importance(model, feature_cols, algorithm)
             
             # 4. Create model signature
             signature = infer_signature(features, target)
             
-            # 5. Log model with MLflow native logging
-            model_info = None
-            if model_type == 'lightgbm':
-                model_info = mlflow.lightgbm.log_model(
-                    lgb_model=model,
-                    name="model",
-                    signature=signature,
-                    registered_model_name=f"crypto_{model_type}_{symbol}"
-                )
-            elif model_type == 'xgboost':
-                model_info = mlflow.xgboost.log_model(
-                    xgb_model=model,
-                    name="model",
-                    signature=signature,
-                    registered_model_name=f"crypto_{model_type}_{symbol}"
-                )
+            # 5. Log model with correct registered name format
+            registered_model_name = f"crypto_{algorithm}_{task_name}_{symbol}"
+            model_info = self._log_model_by_algorithm(model, algorithm, signature, registered_model_name)
             
             # 6. Log additional artifacts and metadata
             self._log_model_artifacts(run.info.run_id, features, target, feature_cols, 
                                     dvc_version_id, symbol, model_type)
             
-            # 7. Tag the run
+            # 7. Tag the run with task-specific information
             mlflow.set_tags({
-                "model_type": model_type,
+                "algorithm": algorithm,
+                "task_name": task_name,
+                "task_type": task_type,
                 "symbol": symbol,
                 "data_version": dvc_version_id,
                 "stage": "training",
-                "framework": model_type,
-                "data_lineage": f"dvc_version:{dvc_version_id}"
+                "framework": algorithm,
+                "data_lineage": f"dvc_version:{dvc_version_id}",
+                "composite_model_type": model_type
             })
             
-            self.logger.info(f"Logged {model_type} model for {symbol} to MLflow")
+            self.logger.info(f"Logged {model_type} model for {symbol} to MLflow as {registered_model_name}")
             return run.info.run_id, model_info.model_uri if model_info else None
+
+    def _get_model_params(self, algorithm, task_type):
+        """Get algorithm and task-specific parameters"""
+        base_params = {
+            'learning_rate': 0.05,
+            'random_state': 42
+        }
+        
+        if algorithm == 'lightgbm':
+            params = {
+                **base_params,
+                'boosting_type': 'gbdt',
+                'num_leaves': 31,
+                'feature_fraction': 0.9,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'verbose': -1
+            }
+            
+            # Task-specific objectives
+            if task_type == 'regression':
+                params.update({'objective': 'regression', 'metric': 'rmse'})
+            elif task_type == 'classification_binary':
+                params.update({'objective': 'binary', 'metric': 'binary_logloss'})
+            elif task_type == 'classification_multi':
+                params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': 5})
+                
+        elif algorithm == 'xgboost':
+            params = {
+                **base_params,
+                'max_depth': 6,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8
+            }
+            
+            # Task-specific objectives
+            if task_type == 'regression':
+                params.update({'objective': 'reg:squarederror', 'eval_metric': 'rmse'})
+            elif task_type == 'classification_binary':
+                params.update({'objective': 'binary:logistic', 'eval_metric': 'logloss'})
+            elif task_type == 'classification_multi':
+                params.update({'objective': 'multi:softprob', 'eval_metric': 'mlogloss', 'num_class': 5})
+        
+        return params
+
+    def _log_feature_importance(self, model, feature_cols, algorithm):
+        """Log feature importance based on algorithm"""
+        try:
+            if algorithm == 'lightgbm' and hasattr(model, 'feature_importance'):
+                feature_importance = model.feature_importance()
+                importance_dict = dict(zip(feature_cols, feature_importance))
+            elif algorithm == 'xgboost' and hasattr(model, 'get_score'):
+                # XGBoost uses get_score() method
+                importance_dict = model.get_score(importance_type='weight')
+                # Map back to original feature names if needed
+                importance_dict = {feat: importance_dict.get(f'f{i}', importance_dict.get(feat, 0)) 
+                                for i, feat in enumerate(feature_cols)}
+            else:
+                return
+            
+            # Log top 10 most important features
+            sorted_importance = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:10]
+            for feat, importance in sorted_importance:
+                mlflow.log_metric(f"feature_importance_{feat}", float(importance))
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to log feature importance: {e}")
+
+    def _log_model_by_algorithm(self, model, algorithm, signature, registered_model_name):
+        """Log model using algorithm-specific MLflow logging"""
+        model_info = None
+        
+        if algorithm == 'lightgbm':
+            model_info = mlflow.lightgbm.log_model(
+                lgb_model=model,
+                name="model",
+                signature=signature,
+                registered_model_name=registered_model_name
+            )
+        elif algorithm == 'xgboost':
+            model_info = mlflow.xgboost.log_model(
+                xgb_model=model,
+                name="model", 
+                signature=signature,
+                registered_model_name=registered_model_name
+            )
+        else:
+            # Fallback to generic sklearn logging
+            model_info = mlflow.sklearn.log_model(
+                sk_model=model,
+                name="model",
+                signature=signature,
+                registered_model_name=registered_model_name
+            )
+        
+        return model_info
     
     def _log_model_artifacts(self, run_id, features, target, feature_cols, 
                            dvc_version_id, symbol, model_type):
@@ -1170,43 +1237,110 @@ class ModelTrainingPipeline:
 
     # Add model promotion methods to your ModelTrainingPipeline class
     def promote_best_models_to_staging(self, training_results):
-        """Promote best performing models to staging based on metrics"""
+        """Promote best performing models to staging based on task-specific metrics"""
         promoted_models = []
         
-        for symbol, symbol_results in training_results['model_results'].items():
-            best_model = None
-            best_metric = float('inf')
-            
-            # Find best model based on RMSE
-            for model_type, model_info in symbol_results['models'].items():
-                rmse = model_info['metrics'].get('rmse', float('inf'))
-                if rmse < best_metric:
-                    best_metric = rmse
-                    best_model = (model_type, model_info)
-            
-            if best_model:
-                model_type, model_info = best_model
-                registered_name = model_info['registered_name']
-                
-                try:
-                    # Promote to staging
-                    version = self.mlflow_registry.promote_model_to_staging(registered_name)
-                    
-                    # Add description
-                    description = f"Best {model_type} model for {symbol} - RMSE: {best_metric:.6f}"
-                    self.mlflow_registry.add_model_description(registered_name, version, description)
-                    
-                    promoted_models.append({
-                        'symbol': symbol,
-                        'model_type': model_type,
-                        'registered_name': registered_name,
-                        'version': version,
-                        'rmse': best_metric
-                    })
-                    
-                    self.logger.info(f"Promoted {registered_name} to staging with RMSE: {best_metric:.6f}")
-                    
-                except Exception as e:
-                    self.logger.error(f"Failed to promote {registered_name}: {e}")
+        # Define promotion criteria for each task type
+        promotion_criteria = {
+            'regression': {
+                'primary_metric': 'rmse',
+                'direction': 'minimize',  # lower is better
+                'fallback_metric': 'r2',
+                'fallback_direction': 'maximize'  # higher is better
+            },
+            'classification_binary': {
+                'primary_metric': 'f1',
+                'direction': 'maximize',  # higher is better
+                'fallback_metric': 'accuracy',
+                'fallback_direction': 'maximize'
+            },
+            'classification_multi': {
+                'primary_metric': 'f1',
+                'direction': 'maximize',
+                'fallback_metric': 'accuracy', 
+                'fallback_direction': 'maximize'
+            }
+        }
         
+        for symbol, symbol_results in training_results['model_results'].items():
+            # Group by task and find best model per task
+            for task_name, task_results in symbol_results['tasks'].items():
+                
+                # Determine task type from PREDICTION_CONFIGS
+                task_config = PREDICTION_CONFIGS.get(task_name, {})
+                task_type = task_config.get('task_type', 'regression')
+                
+                # Get promotion criteria for this task type
+                criteria = promotion_criteria.get(task_type, promotion_criteria['regression'])
+                
+                best_model = None
+                best_metric_value = float('inf') if criteria['direction'] == 'minimize' else float('-inf')
+                
+                # Compare models for this specific task
+                for model_type, model_info in task_results['models'].items():
+                    metrics = model_info.get('metrics', {})
+                    
+                    # Get primary metric
+                    primary_metric = metrics.get(criteria['primary_metric'])
+                    
+                    # Use fallback if primary not available
+                    if primary_metric is None:
+                        primary_metric = metrics.get(criteria['fallback_metric'])
+                        if primary_metric is None:
+                            self.logger.warning(f"No suitable metrics found for {symbol}/{task_name}/{model_type}")
+                            continue
+                    
+                    # Check if this model is better
+                    is_better = False
+                    if criteria['direction'] == 'minimize':
+                        is_better = primary_metric < best_metric_value
+                    else:
+                        is_better = primary_metric > best_metric_value
+                    
+                    if is_better:
+                        best_metric_value = primary_metric
+                        best_model = (model_type, model_info, primary_metric)
+                
+                # Promote the best model for this task
+                if best_model:
+                    model_type, model_info, metric_value = best_model
+                    registered_name = model_info.get('registered_name')
+                    
+                    if not registered_name:
+                        self.logger.error(f"No registered_name found for {symbol}/{task_name}/{model_type}")
+                        continue
+                    
+                    try:
+                        # Promote to staging
+                        version = self.mlflow_registry.promote_model_to_staging(registered_name)
+                        
+                        # Create task-specific description
+                        metric_name = criteria['primary_metric']
+                        description = f"Best {model_type} model for {symbol}/{task_name} - {metric_name}: {metric_value:.6f}"
+                        
+                        self.mlflow_registry.add_model_description(registered_name, version, description)
+                        
+                        promoted_models.append({
+                            'symbol': symbol,
+                            'task': task_name,
+                            'task_type': task_type,
+                            'model_type': model_type,
+                            'registered_name': registered_name,
+                            'version': version,
+                            'metric_name': metric_name,
+                            'metric_value': metric_value
+                        })
+                        
+                        self.logger.info(f"Promoted {registered_name} to staging - {metric_name}: {metric_value:.6f}")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to promote {registered_name}: {e}")
+        
+        # Log summary
+        tasks_promoted = {}
+        for model in promoted_models:
+            task = model['task']
+            tasks_promoted[task] = tasks_promoted.get(task, 0) + 1
+        
+        self.logger.info(f"Promotion summary: {dict(tasks_promoted)}")
         return promoted_models
