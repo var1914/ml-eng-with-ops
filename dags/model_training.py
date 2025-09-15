@@ -303,19 +303,26 @@ class MLflowModelRegistry:
         try:
             if model_version is None:
                 # Get latest version
-                latest_version = self.client.get_latest_versions(
-                    model_name, stages=["None"]
-                )[0]
-                model_version = latest_version.version
+                #But first check if model already promoted to staging:
+                if latest_version := self.client.get_latest_versions(
+                    model_name, stages=["Staging"]
+                ):
+                    self.logger.info(f"Model {model_name} already in Staging")
+                    return latest_version[0].version   
+                else:
+                    latest_version = self.client.get_latest_versions(
+                        model_name, stages=["None"]
+                    )
+                    model_version = latest_version[0].version
             
-            self.client.transition_model_version_stage(
-                name=model_name,
-                version=model_version,
-                stage="Staging"
-            )
-            
-            self.logger.info(f"Promoted {model_name} version {model_version} to Staging")
-            return model_version
+                    self.client.transition_model_version_stage(
+                        name=model_name,
+                        version=model_version,
+                        stage="Staging"
+                    )
+                    
+                    self.logger.info(f"Promoted {model_name} version {model_version} to Staging")
+                    return model_version
             
         except Exception as e:
             self.logger.error(f"Failed to promote model {model_name}: {e}")

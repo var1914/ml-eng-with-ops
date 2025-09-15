@@ -30,7 +30,7 @@ class ModelPromotion:
         
         for model in promoted_models:
             print(f"STAGING: {model['registered_name']}")
-            print(f"   Model: {model['model_type']}, RMSE: {model['rmse']:.6f}")
+            print(f"   Model: {model['model_type']}, Metric Name: {model['metric_name']}, Metrics Value: {model['metric_value']:.6f}")
             print(f"   Version: {model['version']}")
         
         # # STEP 3: Manual promotion to production (after validation)
